@@ -1139,6 +1139,17 @@ enum GitCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// List tracked files (compact tree view; --depth N controls grouping, default 1)
+    #[command(name = "ls-files")]
+    LsFiles {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Tag listing with dates and annotated-tag messages (listing form only)
+    Tag {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Passthrough: runs any unsupported git subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
@@ -2338,6 +2349,20 @@ fn run_cli() -> Result<i32> {
                 GitCommands::Other(args) => {
                     git_cmd::run_passthrough(&args, &global_args, cli.verbose)?
                 }
+                GitCommands::LsFiles { args } => git_cmd::run(
+                    git_cmd::GitCommand::LsFiles,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Tag { args } => git_cmd::run(
+                    git_cmd::GitCommand::Tag,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
             }
         }
 
