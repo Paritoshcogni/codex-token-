@@ -5215,7 +5215,7 @@ mod tests {
     #[test]
     fn test_rewrite_kubectl_with_context_flag() {
         assert_eq!(
-            rewrite_command("kubectl --context msquant-test get pods -n test", &[]),
+            rewrite_command("kubectl --context msquant-test get pods -n test", &[], &[]),
             Some("rtk kubectl --context msquant-test get pods -n test".into())
         );
     }
@@ -5223,7 +5223,7 @@ mod tests {
     #[test]
     fn test_rewrite_kubectl_short_namespace_flag() {
         assert_eq!(
-            rewrite_command("kubectl -n test get pods", &[]),
+            rewrite_command("kubectl -n test get pods", &[], &[]),
             Some("rtk kubectl -n test get pods".into())
         );
     }
@@ -5231,7 +5231,7 @@ mod tests {
     #[test]
     fn test_rewrite_kubectl_exec_subcommand() {
         assert_eq!(
-            rewrite_command("kubectl exec -n test pod-0 -- psql", &[]),
+            rewrite_command("kubectl exec -n test pod-0 -- psql", &[], &[]),
             Some("rtk kubectl exec -n test pod-0 -- psql".into())
         );
     }
