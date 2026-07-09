@@ -147,7 +147,7 @@ pub fn truncate_output(output: &str, max_chars: usize) -> String {
 
     let omitted = total - head_budget - tail_char_count;
     format!(
-        "{}\n\n[RTK:PASSTHROUGH] {} chars omitted — showing last {} lines\n\n{}",
+        "{}\n\n[RTK:PASSTHROUGH] Output truncated ({} chars omitted — showing last {} lines)\n\n{}",
         head, omitted, TAIL_LINES, tail
     )
 }
