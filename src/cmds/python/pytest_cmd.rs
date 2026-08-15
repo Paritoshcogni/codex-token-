@@ -1,6 +1,5 @@
 //! Filters pytest output to show only failures and the summary line.
 
-use crate::core::config;
 use crate::core::runner;
 use crate::core::shell::display_args;
 use crate::core::truncate::CAP_WARNINGS;
@@ -76,7 +75,13 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
                     config::limits().passthrough_max_chars,
                 );
             }
-            filtered
+            // Exit 5 = no tests collected: a legitimate, non-error outcome.
+            if exit_code == PYTEST_EXIT_NO_TESTS {
+                return filtered;
+            }
+            // Never render a green verdict ("No tests collected", "N passed")
+            // when the run actually failed.
+            crate::core::guard::guard_exit(raw, exit_code, "pytest", &filtered)
         },
         runner::RunOptions::stdout_only().tee("pytest"),
     )
