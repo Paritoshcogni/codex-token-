@@ -124,7 +124,13 @@ impl ApprovalOwner {
 /// 1. **Deny wins outright.** Checked before anything else so a denied command
 ///    is never even considered for rewriting. A deny rule matched inside a
 ///    shell wrapper's script yields `Defer` instead: no rewrite, no decision.
-/// 2. **Unattestable constructs are refused.** Command substitution and
+/// 2. **A provably-fish script is wrapped.** A host that evaluates the command
+///    string with a POSIX layer fails to parse it before RTK is consulted at
+///    all, so it is handed back as `rtk run --shell fish -c '<script>'` — with
+///    its own commands rewritten first, so wrapping costs no savings. The wrap
+///    refuses everything gate 3 refuses, and `hooks.wrap_fish_scripts` turns it
+///    off; `src/hooks/README.md` records why it runs ahead of that gate.
+/// 3. **Unattestable constructs are refused.** Command substitution and
 ///    file-target redirects can't be decomposed into segments the permission
 ///    gate can check individually, so a rewrite could smuggle an unchecked
 ///    command past an allow rule. `check_command_with_rules` already forces
@@ -133,7 +139,7 @@ impl ApprovalOwner {
 ///    this gate only because a `<<` operand reads as a file target; what
 ///    actually refuses them is `rewrite_command`'s own `has_heredoc`, which
 ///    catches the forms this gate lets past (see #3980).
-/// 3. **Otherwise rewrite if a rule matches**, and auto-allow only on an
+/// 4. **Otherwise rewrite if a rule matches**, and auto-allow only on an
 ///    explicit `Allow`. Every other verdict — including `Default`, where no
 ///    rule matched at all — yields `AskRewrite`. `Default` must never reach
 ///    `AllowRewrite`: that would auto-approve every rewritable command on a
@@ -190,10 +196,14 @@ pub(crate) fn decide_with_wrap(
 
     // A provably-fish script fails to parse in a POSIX host layer before RTK is
     // ever consulted, so it is handed back as one quoted argument every layer
-    // can parse. Never auto-allowed: the script's content is not attested, so
-    // its strongest verdict is `Ask` even under an explicit allow rule.
-    if let Some(wrapped) = wrap_fish(cmd) {
-        return HookDecision::AskRewrite(wrapped);
+    // can parse. Its own commands are rewritten first — the wrap would
+    // otherwise cost every saving the rewrite rules deliver for the script's
+    // leading command. Never auto-allowed: the script's content is not
+    // attested, so its strongest verdict is `Ask` even under an allow rule.
+    if wrap_fish(cmd).is_some() {
+        let rewritten = rewrite_command(cmd, excluded, transparent_prefixes);
+        let script = rewritten.as_deref().unwrap_or(cmd);
+        return HookDecision::AskRewrite(crate::discover::fish_script::wrap(script));
     }
 
     if crate::discover::lexer::contains_unattestable_construct(cmd) {
@@ -620,6 +630,44 @@ mod tests {
                 ),
                 HookDecision::AskRewrite(
                     "rtk run --shell fish -c 'test -d src; and git status'".to_string()
+                )
+            );
+        }
+
+        /// The wrap used to cost every saving the rewrite rules deliver for the
+        /// script's own commands. They are rewritten first, inside the wrap.
+        #[cfg(not(windows))]
+        #[test]
+        fn fish_script_keeps_the_rewrite_it_would_have_had() {
+            assert_eq!(
+                decide_with_wrap(
+                    "git diff HEAD~3 HEAD; and true",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[],
+                    wrap_stub
+                ),
+                HookDecision::AskRewrite(
+                    "rtk run --shell fish -c 'rtk git diff HEAD~3 HEAD; and true'".to_string()
+                )
+            );
+        }
+
+        /// The rewrite inside the wrap honours the same configuration the
+        /// unwrapped path does.
+        #[cfg(not(windows))]
+        #[test]
+        fn the_nested_rewrite_honours_exclusions() {
+            assert_eq!(
+                decide_with_wrap(
+                    "git diff HEAD~3 HEAD; and true",
+                    PermissionVerdict::Default,
+                    &["git".to_string()],
+                    &[],
+                    wrap_stub
+                ),
+                HookDecision::AskRewrite(
+                    "rtk run --shell fish -c 'git diff HEAD~3 HEAD; and true'".to_string()
                 )
             );
         }

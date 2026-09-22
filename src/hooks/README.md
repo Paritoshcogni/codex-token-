@@ -95,13 +95,34 @@ them.
 
 Unambiguously-fish scripts (a fish-only keyword such as `end`, `begin`,
 `switch`, `and`, `or`, or `not` at command position, with no POSIX
-disambiguator) are rewritten to `rtk run --shell fish -c '<script>'`
-(`discover/fish_script.rs`) before the rewrite rules are consulted, so a POSIX
-host layer does not fail on fish syntax before the command runs. Like wrapper
-rewrites, the wrapped form is never auto-allowed — its strongest verdict is
-`Ask` — and deny rules are checked first. The wrap is skipped without a
-resolvable `fish` binary, on Windows, or when `hooks.wrap_fish_scripts =
-false`; those cases take the decision path they always did.
+disambiguator anywhere, comments excluded before anything is classified) are
+rewritten to `rtk run --shell fish -c '<script>'` (`discover/fish_script.rs`),
+with the script's own commands rewritten inside the wrap so it costs no
+savings. Like wrapper rewrites, the wrapped form is never auto-allowed — its
+strongest verdict is `Ask` — and deny rules are checked first. The wrap is
+skipped without a resolvable `fish` binary, on Windows, or when
+`hooks.wrap_fish_scripts = false`; those cases take the decision path they
+always did.
+
+**Why it runs before the unattestable gate.** Every other rewrite refuses a
+command the gate could not decompose. The wrap cannot wait for that gate and
+still do its job: a host that evaluates the command string with a POSIX layer
+fails to parse a fish script *before* RTK is consulted at all, so deferring
+means the command is lost rather than merely unrewritten. What it does instead
+is refuse everything that gate refuses — command and process substitution,
+file-target redirects, and fish's own `(cmd)` substitution, which the shared
+bash lexer reads as a subshell — so the only scripts that reach the wrap are
+ones whose sole unattestable property is fish control flow (`; and`,
+`if … end`), which the shared segmenter cannot split into commands. For those:
+
+- the script travels byte-identical inside one quoted argument — RTK decides
+  nothing about its contents beyond the rewrite rules it applies to them;
+- the verdict is `Ask`, never `Allow`, and a deny rule still wins outright;
+- the residual exposure is a host that treats an `rtk`-prefixed command as
+  pre-approved. Codex does: it renders `Ask` as a protocol-level `allow` and
+  its own safe/dangerous classifiers do not unwrap `rtk` (see `hook_cmd.rs`).
+  `hooks.wrap_fish_scripts = false` is the switch for a host where that
+  trade is not wanted.
 
 | Verdict | Trigger | rewrite_cmd exit | Hook behavior |
 |---------|---------|-----------------|---------------|

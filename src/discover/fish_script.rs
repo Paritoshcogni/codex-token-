@@ -78,6 +78,15 @@ fn try_wrap_with_probes(
     if !is_unambiguous_fish(script) {
         return None;
     }
+    // The wrap is the one rewrite RTK emits for a script it did not decompose,
+    // so it refuses what the permission gate refuses: command/process
+    // substitution and file-target redirects, plus fish's own `(cmd)`
+    // substitution, which the shared gate reads as a subshell. What is left is
+    // control flow — `; and`, `if … end` — which the host would have failed to
+    // parse at all. See `src/hooks/README.md`.
+    if lexer::contains_unattestable_construct(script) || contains_fish_substitution(script) {
+        return None;
+    }
     // Fish single-quoted strings diverge from POSIX single-quote semantics for
     // exactly two sequences: `\\` collapses to one backslash and `\'` becomes a
     // literal quote (a backslash before any other character is literal in both).
@@ -91,19 +100,93 @@ fn try_wrap_with_probes(
         return None;
     }
 
-    Some(format!(
+    Some(wrap(script))
+}
+
+/// Assemble the wrapped form for a script already cleared by the gates.
+///
+/// Separate from [`try_wrap`] so the caller can rewrite the script's own
+/// commands first and wrap the result: the gates answer for the script the host
+/// submitted, the assembly runs on the one RTK hands back.
+pub(crate) fn wrap(script: &str) -> String {
+    format!(
         "rtk run --shell fish -c '{}'",
-        escape_single_quoted(script)
-    ))
+        escape_single_quoted(script.trim())
+    )
+}
+
+/// True for fish's `(cmd)` command substitution, which the shared lexer reads
+/// as a POSIX subshell and therefore does not refuse.
+fn contains_fish_substitution(cmd: &str) -> bool {
+    lexer::tokenize_with_newlines(cmd)
+        .iter()
+        .any(|token| token.kind == TokenKind::Shellism && matches!(token.value.as_str(), "(" | ")"))
 }
 
 /// True only when the command contains a fish-only marker at command position and
 /// nothing a POSIX shell would need to parse it (see module docs for the lists).
 pub(crate) fn is_unambiguous_fish(cmd: &str) -> bool {
-    if cmd.contains('\0') || has_unclosed_quote_or_escape(cmd) {
+    if cmd.contains('\0') {
         return false;
     }
-    classify_tokens(&lexer::tokenize_with_newlines(cmd))
+    // A trailing comment is prose, not code: `echo $((1+2))  # x; and y` is a
+    // POSIX command whose comment happens to contain a separator and an English
+    // `and`. Every shell here agrees where a comment starts and ends, so the
+    // span is dropped before anything is classified.
+    let code = strip_comments(cmd);
+    if has_unclosed_quote_or_escape(&code) {
+        return false;
+    }
+    classify_tokens(&lexer::tokenize_with_newlines(&code))
+}
+
+/// Drop every unquoted comment — a word-initial `#` through the end of its line.
+fn strip_comments(cmd: &str) -> String {
+    let mut code = String::with_capacity(cmd.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut at_word_start = true;
+    let mut in_comment = false;
+
+    for character in cmd.chars() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+                at_word_start = true;
+                code.push(character);
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            at_word_start = false;
+            code.push(character);
+            continue;
+        }
+        match character {
+            '\\' if quote != Some('\'') => {
+                escaped = true;
+                at_word_start = false;
+            }
+            '#' if quote.is_none() && at_word_start => {
+                in_comment = true;
+                continue;
+            }
+            '\'' | '"' => {
+                quote = match quote {
+                    Some(open) if open == character => None,
+                    None => Some(character),
+                    open => open,
+                };
+                at_word_start = false;
+            }
+            ' ' | '\t' | '\n' if quote.is_none() => at_word_start = true,
+            _ => at_word_start = false,
+        }
+        code.push(character);
+    }
+
+    code
 }
 
 /// True while a quote or an escape is still open at the end of `cmd`.
@@ -275,6 +358,33 @@ mod tests {
         assert!(!is_unambiguous_fish("printf '%s\\n' and"));
     }
 
+    /// A comment is prose. Its separators and its English words are not code,
+    /// and a POSIX command carrying one must not be handed to fish, which would
+    /// fail to parse the live part and run nothing at all.
+    #[test]
+    fn test_comment_text_is_never_a_marker() {
+        for cmd in [
+            "echo $((1+2))  # x; and y",
+            "echo \"${HOME}\"  # note; and more",
+            "ls -la  # long listing; and hidden files",
+            "ls # don't; and rm -rf /",
+        ] {
+            assert!(
+                !is_unambiguous_fish(cmd),
+                "comment must not classify: {cmd:?}"
+            );
+            assert!(try_wrap_gated(cmd, true).is_none(), "{cmd:?}");
+        }
+    }
+
+    /// A `#` inside quotes is an argument, and a fish script may carry a
+    /// comment of its own — neither changes the answer.
+    #[test]
+    fn test_comment_stripping_leaves_code_alone() {
+        assert!(!is_unambiguous_fish("rg '#end' src/"));
+        assert!(is_unambiguous_fish("test -d src; and git status # checked"));
+    }
+
     #[test]
     fn test_quoted_fish_syntax_is_not_marker() {
         assert!(!is_unambiguous_fish("echo 'if x; and y; end'"));
@@ -377,6 +487,26 @@ mod tests {
     fn test_posix_and_ambiguous_scripts_are_not_wrapped() {
         assert!(try_wrap_gated("if [ -d src ]; then git status; fi", true).is_none());
         assert!(try_wrap_gated("git status && cargo build", true).is_none());
+    }
+
+    /// The wrap refuses what the permission gate refuses. A script whose
+    /// segments cannot be decomposed — substitution, a file-target redirect, or
+    /// fish's own `(cmd)` — keeps the defer behaviour instead of being emitted
+    /// as an `rtk`-prefixed command.
+    #[test]
+    fn test_unattestable_scripts_are_not_wrapped() {
+        for cmd in [
+            "test -d src; and cat /etc/passwd > /tmp/leak",
+            "test -d src; and echo $(whoami)",
+            "test -d src; and echo `whoami`",
+            "for f in (ls)\n  echo $f\nend",
+            "begin; git status > out.txt; end",
+        ] {
+            assert!(
+                try_wrap_gated(cmd, true).is_none(),
+                "unattestable script must defer: {cmd:?}"
+            );
+        }
     }
 
     #[test]

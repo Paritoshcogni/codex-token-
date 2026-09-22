@@ -36,12 +36,22 @@ mod unix {
             .expect("run rtk rewrite")
     }
 
+    /// Both branches assert: with `fish` the hook must wrap, without it the
+    /// wrap must be skipped rather than half-applied. A test that returns early
+    /// asserts nothing on a runner with no `fish`, which is most of them.
     #[test]
     fn rewrite_wraps_multiline_fish_block_as_ask() {
-        if which::which("fish").is_err() {
-            return; // wrap requires a resolvable fish binary
-        }
         let output = rewrite_isolated(FISH_BLOCK, None);
+
+        if which::which("fish").is_err() {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "without fish the wrap must defer"
+            );
+            assert!(output.stdout.is_empty());
+            return;
+        }
 
         assert_eq!(output.status.code(), Some(3), "wrap must surface as Ask");
         assert_eq!(
@@ -49,6 +59,39 @@ mod unix {
             format!("rtk run --shell fish -c '{FISH_BLOCK}'")
         );
         assert!(output.stderr.is_empty());
+    }
+
+    /// The wrap carries the rewrite the command would have had without it.
+    #[test]
+    fn rewrite_keeps_the_inner_rewrite_inside_the_wrap() {
+        let output = rewrite_isolated("git diff HEAD~3 HEAD; and true", None);
+
+        if which::which("fish").is_err() {
+            assert_eq!(output.status.code(), Some(1));
+            return;
+        }
+
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "rtk run --shell fish -c 'rtk git diff HEAD~3 HEAD; and true'"
+        );
+    }
+
+    /// A script the permission gate could not decompose is never emitted as an
+    /// `rtk`-prefixed command, with or without a local `fish`.
+    #[test]
+    fn rewrite_defers_unattestable_fish_scripts() {
+        for command in [
+            "test -d src; and cat /etc/passwd > /tmp/rtk-leak-test",
+            "test -d src; and echo $(whoami)",
+            "for f in (ls)\n  echo $f\nend",
+        ] {
+            let output = rewrite_isolated(command, None);
+
+            assert_eq!(output.status.code(), Some(1), "{command:?}");
+            assert!(output.stdout.is_empty(), "{command:?}");
+        }
     }
 
     #[test]
