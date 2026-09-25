@@ -84,7 +84,14 @@ fn try_wrap_with_probes(
     // substitution, which the shared gate reads as a subshell. What is left is
     // control flow — `; and`, `if … end` — which the host would have failed to
     // parse at all. See `src/hooks/README.md`.
-    if lexer::contains_unattestable_construct(script) || contains_fish_substitution(script) {
+    //
+    // Read from the same comment-stripped text the classification uses. An
+    // apostrophe in a comment opens the shared lexer's quote state and swallows
+    // everything after it into one argument, so a gate reading the raw script
+    // sees no redirect and no substitution at all while the classifier, reading
+    // the stripped code, sees clean fish.
+    let code = strip_comments(script);
+    if lexer::contains_unattestable_construct(&code) || contains_fish_substitution(&code) {
         return None;
     }
     // Fish single-quoted strings diverge from POSIX single-quote semantics for
@@ -180,7 +187,9 @@ fn strip_comments(cmd: &str) -> String {
                 };
                 at_word_start = false;
             }
-            ' ' | '\t' | '\n' if quote.is_none() => at_word_start = true,
+            // A word also starts after an unquoted operator: both bash and fish
+            // read `cmd;# note` as a command and a comment.
+            ' ' | '\t' | '\n' | ';' | '|' | '&' if quote.is_none() => at_word_start = true,
             _ => at_word_start = false,
         }
         code.push(character);
@@ -368,6 +377,11 @@ mod tests {
             "echo \"${HOME}\"  # note; and more",
             "ls -la  # long listing; and hidden files",
             "ls # don't; and rm -rf /",
+            // A word starts after an unquoted operator too, so the `#` glued to
+            // one opens a comment just as a spaced `#` does.
+            "echo ${HOME:-x};# note; and more",
+            "ls -la|# note; and more",
+            "sleep 1&# note; and more",
         ] {
             assert!(
                 !is_unambiguous_fish(cmd),
@@ -496,7 +510,7 @@ mod tests {
     #[test]
     fn test_unattestable_scripts_are_not_wrapped() {
         for cmd in [
-            "test -d src; and cat /etc/passwd > /tmp/leak",
+            "test -d src; and cat secrets.env > /tmp/leak",
             "test -d src; and echo $(whoami)",
             "test -d src; and echo `whoami`",
             "for f in (ls)\n  echo $f\nend",
@@ -505,6 +519,24 @@ mod tests {
             assert!(
                 try_wrap_gated(cmd, true).is_none(),
                 "unattestable script must defer: {cmd:?}"
+            );
+        }
+    }
+
+    /// An apostrophe in a comment opens the shared lexer's quote state and
+    /// swallows the rest of the script into one argument, so a gate reading the
+    /// raw text sees neither the redirect nor the substitution that follows.
+    /// The gates read the same stripped code the classification does.
+    #[test]
+    fn test_a_comment_quote_cannot_blind_the_gates() {
+        for cmd in [
+            "test -d src; and git status # don't\ncat secrets.env > /tmp/leak",
+            "test -d src; and git status # don't\necho SUBST=(whoami)",
+            "test -d src; and git status # 5\" wide\ncat secrets.env > /tmp/leak",
+        ] {
+            assert!(
+                try_wrap_gated(cmd, true).is_none(),
+                "a comment must not hide what follows it: {cmd:?}"
             );
         }
     }

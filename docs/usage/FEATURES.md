@@ -1351,14 +1351,20 @@ reecrit en execution fish explicite :
 
 ```
 if test -d src\n  git status\nend
--> rtk run --shell fish -c 'if test -d src\n  git status\nend'
+-> rtk run --shell fish -c 'if test -d src\n  rtk git status\nend'
 ```
 
 Points cles :
+- Les commandes du script passent d'abord par les regles de reecriture
+  habituelles : l'encapsulation ne coute aucune economie.
 - La reecriture est toujours en mode « ask » (jamais auto-approuvee) : le
   contenu du script n'est pas attestable.
 - Necessite un binaire `fish` resolvable ; desactive sous Windows.
 - Les scripts ambigus ou POSIX passent inchanges, comme avant.
+- Passent aussi inchanges les scripts que RTK ne peut pas decomposer pour la
+  verification des permissions : substitution de commande (y compris la forme
+  fish `(cmd)`) et redirection vers un fichier — donc `for f in (ls) ... end`
+  n'est pas encapsule.
 - Desactivable via `wrap_fish_scripts = false` dans la section `[hooks]`.
 
 ---

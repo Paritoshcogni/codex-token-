@@ -65,15 +65,20 @@ mod unix {
     #[test]
     fn rewrite_keeps_the_inner_rewrite_inside_the_wrap() {
         let output = rewrite_isolated("git diff HEAD~3 HEAD; and true", None);
+        let rewritten = String::from_utf8_lossy(&output.stdout);
 
         if which::which("fish").is_err() {
-            assert_eq!(output.status.code(), Some(1));
+            // The leading command is rewritable on its own, so without a `fish`
+            // to wrap for this is an ordinary rewrite — not a defer. Asserting
+            // the exact string is what pins the wrap as genuinely off.
+            assert_eq!(output.status.code(), Some(3));
+            assert_eq!(rewritten, "rtk git diff HEAD~3 HEAD; and true");
             return;
         }
 
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
+            rewritten,
             "rtk run --shell fish -c 'rtk git diff HEAD~3 HEAD; and true'"
         );
     }
@@ -83,7 +88,8 @@ mod unix {
     #[test]
     fn rewrite_defers_unattestable_fish_scripts() {
         for command in [
-            "test -d src; and cat /etc/passwd > /tmp/rtk-leak-test",
+            "test -d src; and cat secrets.env > /tmp/rtk-leak-test",
+            "test -d src; and git status # don't\ncat secrets.env > /tmp/rtk-leak-test",
             "test -d src; and echo $(whoami)",
             "for f in (ls)\n  echo $f\nend",
         ] {
@@ -112,9 +118,6 @@ mod unix {
 
     #[test]
     fn rewrite_defers_fish_script_with_divergent_backslash() {
-        if which::which("fish").is_err() {
-            return; // with fish present, the veto is the only reason to defer
-        }
         // Classifies fish (`; and` marker) but contains `\\`, which fish
         // single-quotes would collapse — the wrapper vetoes it, so the hook
         // defers instead of emitting a wrap that would corrupt the script.

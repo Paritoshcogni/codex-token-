@@ -111,12 +111,16 @@ fails to parse a fish script *before* RTK is consulted at all, so deferring
 means the command is lost rather than merely unrewritten. What it does instead
 is refuse everything that gate refuses — command and process substitution,
 file-target redirects, and fish's own `(cmd)` substitution, which the shared
-bash lexer reads as a subshell — so the only scripts that reach the wrap are
-ones whose sole unattestable property is fish control flow (`; and`,
-`if … end`), which the shared segmenter cannot split into commands. For those:
+bash lexer reads as a subshell — reading the same comment-stripped text the
+classification uses, so a quote in a comment cannot blind it. The only scripts
+that reach the wrap are ones whose sole unattestable property is fish control
+flow (`; and`, `if … end`), which the shared segmenter cannot split into
+commands. For those:
 
-- the script travels byte-identical inside one quoted argument — RTK decides
-  nothing about its contents beyond the rewrite rules it applies to them;
+- the script travels inside one quoted argument and RTK decides nothing about
+  its contents beyond the rewrite rules it applies to them — those rules are
+  the one edit it makes, so the argument carries the same commands rather than
+  the same bytes;
 - the verdict is `Ask`, never `Allow`, and a deny rule still wins outright;
 - the residual exposure is a host that treats an `rtk`-prefixed command as
   pre-approved. Codex does: it renders `Ask` as a protocol-level `allow` and
