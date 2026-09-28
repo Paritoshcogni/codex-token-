@@ -90,7 +90,7 @@ fn try_wrap_with_probes(
     // everything after it into one argument, so a gate reading the raw script
     // sees no redirect and no substitution at all while the classifier, reading
     // the stripped code, sees clean fish.
-    let code = strip_comments(script);
+    let code = strip_comments(script)?;
     if lexer::contains_unattestable_construct(&code) || contains_fish_substitution(&code) {
         return None;
     }
@@ -138,28 +138,50 @@ pub(crate) fn is_unambiguous_fish(cmd: &str) -> bool {
     }
     // A trailing comment is prose, not code: `echo $((1+2))  # x; and y` is a
     // POSIX command whose comment happens to contain a separator and an English
-    // `and`. Every shell here agrees where a comment starts and ends, so the
-    // span is dropped before anything is classified.
-    let code = strip_comments(cmd);
+    // `and`. The span is dropped before anything is classified — and where the
+    // two shells disagree about where it starts, nothing is classified at all.
+    let Some(code) = strip_comments(cmd) else {
+        return false;
+    };
     if has_unclosed_quote_or_escape(&code) {
         return false;
     }
     classify_tokens(&lexer::tokenize_with_newlines(&code))
 }
 
-/// Drop every unquoted comment — a word-initial `#` through the end of its line.
-fn strip_comments(cmd: &str) -> String {
+/// Drop every unquoted comment — a word-initial `#` through the end of its line
+/// — or report that the two shells do not agree where the comment starts.
+///
+/// `&` is the one boundary character they read differently. Since fish 3.0 it
+/// is job control only at the end of a job, so a `#` glued to it continues the
+/// word rather than opening a comment:
+///
+/// ```text
+/// bash -c 'echo A&#y'   ->  A        (comment)
+/// fish -c 'echo A&#y'   ->  A&#y     (one literal word)
+/// ```
+///
+/// Taking either reading is wrong: bash's hides whatever follows from the gates
+/// while fish executes it, and fish's re-admits the comment text as code. The
+/// scanner refuses instead, and the script keeps the host's own behaviour.
+fn strip_comments(cmd: &str) -> Option<String> {
     let mut code = String::with_capacity(cmd.len());
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut at_word_start = true;
     let mut in_comment = false;
+    // Unquoted, unescaped `&` immediately before the character being read: one
+    // is job control, two are the `and` operator, and an escaped or quoted `&`
+    // is an ordinary character that resets the run.
+    let mut ampersands = 0usize;
 
     for character in cmd.chars() {
         if in_comment {
             if character == '\n' {
                 in_comment = false;
                 at_word_start = true;
+                // The run belonged to the line the comment closed.
+                ampersands = 0;
                 code.push(character);
             }
             continue;
@@ -167,6 +189,7 @@ fn strip_comments(cmd: &str) -> String {
         if escaped {
             escaped = false;
             at_word_start = false;
+            ampersands = 0;
             code.push(character);
             continue;
         }
@@ -174,8 +197,14 @@ fn strip_comments(cmd: &str) -> String {
             '\\' if quote != Some('\'') => {
                 escaped = true;
                 at_word_start = false;
+                ampersands = 0;
             }
             '#' if quote.is_none() && at_word_start => {
+                // `&&#` is an operator followed by a comment in both shells;
+                // a lone `&#` is where they diverge.
+                if ampersands == 1 {
+                    return None;
+                }
                 in_comment = true;
                 continue;
             }
@@ -186,16 +215,27 @@ fn strip_comments(cmd: &str) -> String {
                     open => open,
                 };
                 at_word_start = false;
+                ampersands = 0;
+            }
+            '&' if quote.is_none() => {
+                at_word_start = true;
+                ampersands += 1;
             }
             // A word also starts after an unquoted operator: both bash and fish
             // read `cmd;# note` as a command and a comment.
-            ' ' | '\t' | '\n' | ';' | '|' | '&' if quote.is_none() => at_word_start = true,
-            _ => at_word_start = false,
+            ' ' | '\t' | '\n' | ';' | '|' if quote.is_none() => {
+                at_word_start = true;
+                ampersands = 0;
+            }
+            _ => {
+                at_word_start = false;
+                ampersands = 0;
+            }
         }
         code.push(character);
     }
 
-    code
+    Some(code)
 }
 
 /// True while a quote or an escape is still open at the end of `cmd`.
@@ -389,6 +429,54 @@ mod tests {
             );
             assert!(try_wrap_gated(cmd, true).is_none(), "{cmd:?}");
         }
+    }
+
+    /// `&` is the one boundary character bash and fish read differently: a `#`
+    /// glued to it opens a comment in bash and continues the word in fish. Bash's
+    /// reading would hide a redirect from the gates that fish then executes;
+    /// fish's would re-admit comment text as code. Neither is safe, so the
+    /// script is left to the host.
+    #[test]
+    fn test_a_comment_glued_to_an_ampersand_is_never_classified() {
+        for cmd in [
+            "test -d src; and echo HIT&#y > /tmp/LEAK",
+            "test -d src; and echo HIT&#y (whoami)",
+            "if test -d src\n  echo A&#y > /tmp/LEAK\nend",
+            "sleep 1&# note; and more",
+        ] {
+            assert!(
+                !is_unambiguous_fish(cmd),
+                "dialects disagree, so nothing is classified: {cmd:?}"
+            );
+            assert!(try_wrap_gated(cmd, true).is_none(), "{cmd:?}");
+        }
+    }
+
+    /// `&&` and `||` are operators in both shells, so a `#` after them is a
+    /// comment in both — those keep the ordinary strip.
+    #[test]
+    fn test_operator_pairs_still_end_a_word() {
+        // The marker sits *outside* the comment, so stripping is what leaves a
+        // classifiable script: these rows fail if the refusal widens to `&&`,
+        // `||` or a spaced `&`, which both shells read the same way.
+        assert!(is_unambiguous_fish("test -d src; and git status &&# note"));
+        assert!(is_unambiguous_fish("test -d src; and git status ||# note"));
+        assert!(is_unambiguous_fish("test -d src; and git status & # note"));
+
+        // An escaped `&` is an ordinary character, so the `&` after it is the
+        // lone one the shells disagree about — that still refuses.
+        assert!(!is_unambiguous_fish(
+            "test -d src; and echo \\&&#y > /tmp/LEAK"
+        ));
+    }
+
+    /// The ampersand run belongs to the line it was read on: a `&&` that ended
+    /// in a comment must not make the next line's lone `&#` read as a pair.
+    #[test]
+    fn test_the_ampersand_run_does_not_cross_a_comment() {
+        assert!(!is_unambiguous_fish(
+            "true; and echo ok &&# comment\n&#y > /tmp/LEAK"
+        ));
     }
 
     /// A `#` inside quotes is an argument, and a fish script may carry a

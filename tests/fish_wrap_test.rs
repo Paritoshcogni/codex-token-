@@ -36,6 +36,46 @@ mod unix {
             .expect("run rtk rewrite")
     }
 
+    /// `rtk rewrite` under a live deny rule, in an isolated home.
+    fn rewrite_denied(command: &str) -> Output {
+        let home = tempfile::tempdir().expect("create isolated home");
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).expect("create .claude");
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"permissions":{"deny":["Bash(rm:*)"]}}"#,
+        )
+        .expect("write settings");
+
+        rtk()
+            .args(["rewrite", command])
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("RTK_TELEMETRY_DISABLED", "1")
+            .output()
+            .expect("run rtk rewrite")
+    }
+
+    /// A deny rule outranks the wrap in every spelling, not only the ones the
+    /// bash-shaped segmenter can read. `and rm -rf …` is a command called `and`
+    /// to that segmenter, but the wrap hands the script to a fish, which runs
+    /// the `rm` — so the rule has to reach it (exit 2 is the deny contract).
+    #[test]
+    fn deny_outranks_the_wrap_in_every_spelling() {
+        for command in [
+            "rm -rf victim",
+            "if test -d src\n  rm -rf victim\nend",
+            "test -d src; and rm -rf victim",
+            "not rm -rf victim",
+        ] {
+            let output = rewrite_denied(command);
+
+            assert_eq!(output.status.code(), Some(2), "{command:?}");
+            assert!(output.stdout.is_empty(), "{command:?}");
+        }
+    }
+
     /// Both branches assert: with `fish` the hook must wrap, without it the
     /// wrap must be skipped rather than half-applied. A test that returns early
     /// asserts nothing on a runner with no `fish`, which is most of them.
