@@ -2,6 +2,8 @@
 //! `rtk run --shell fish -c '<script>'` form, the quoting round-trips under
 //! POSIX and fish host layers, and `rtk run` executes the wrapped script.
 
+mod common;
+
 #[cfg(unix)]
 mod unix {
     use std::process::{Command, Output};
@@ -9,7 +11,7 @@ mod unix {
     const FISH_BLOCK: &str = "if test -d src\n  git status\nelse\n  echo missing\nend";
 
     fn rtk() -> Command {
-        Command::new(env!("CARGO_BIN_EXE_rtk"))
+        crate::common::rtk_command()
     }
 
     /// Run `rtk rewrite` with an isolated home so user config and Claude Code
@@ -57,22 +59,62 @@ mod unix {
             .expect("run rtk rewrite")
     }
 
-    /// A deny rule outranks the wrap in every spelling, not only the ones the
-    /// bash-shaped segmenter can read. `and rm -rf …` is a command called `and`
-    /// to that segmenter, but the wrap hands the script to a fish, which runs
-    /// the `rm` — so the rule has to reach it (exit 2 is the deny contract).
+    /// A deny rule keeps the wrap off, in every placement — not only the ones
+    /// the bash-shaped segmenter can read.
+    ///
+    /// The property is *never wrapped*, not a particular exit code: fish starts
+    /// commands where bash has no grammar at all (the condition of an `if` or a
+    /// `while`, the right side of `and`/`or`/`not`), and bash refuses those
+    /// scripts outright, so the rule only has to hold wherever RTK would hand
+    /// the script to a fish. Exit 1 (defer, as `develop` answers) is the usual
+    /// outcome; exit 3 — a wrap — is the failure.
     #[test]
-    fn deny_outranks_the_wrap_in_every_spelling() {
+    fn deny_keeps_the_wrap_off_in_every_placement() {
         for command in [
             "rm -rf victim",
             "if test -d src\n  rm -rf victim\nend",
             "test -d src; and rm -rf victim",
             "not rm -rf victim",
+            "if not rm -rf victim\n  echo x\nend",
+            "while not rm -rf victim\n  break\nend",
+            "if rm -rf victim\n  echo x\nend",
+            "while rm -rf victim\n  break\nend",
+            "if test -d src\n  true; and rm -rf victim\nend",
+            // Quoting the program changes nothing: the words are compared
+            // dequoted, the way the shell reads them.
+            "if not 'rm' -rf victim\n  echo x\nend",
+            "if not r'm' -rf victim\n  echo x\nend",
+            "if not \"rm\" -rf victim\n  echo x\nend",
         ] {
             let output = rewrite_denied(command);
 
-            assert_eq!(output.status.code(), Some(2), "{command:?}");
+            assert_ne!(
+                output.status.code(),
+                Some(3),
+                "a denied command must never be wrapped: {command:?}"
+            );
             assert!(output.stdout.is_empty(), "{command:?}");
+        }
+    }
+
+    /// The rule is about what it names: a script with nothing denied in it
+    /// still wraps, and a rule naming something else does not stop it.
+    #[test]
+    fn an_unrelated_deny_rule_leaves_the_wrap_alone() {
+        if which::which("fish").is_err() {
+            return;
+        }
+        for command in [
+            "test -d src; and git status",
+            "if test -d src\n  git status\nend",
+        ] {
+            let output = rewrite_denied(command);
+
+            assert_eq!(output.status.code(), Some(3), "{command:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).starts_with("rtk run --shell fish -c"),
+                "{command:?}"
+            );
         }
     }
 

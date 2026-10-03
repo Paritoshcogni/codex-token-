@@ -122,6 +122,18 @@ pub(crate) fn wrap(script: &str) -> String {
     )
 }
 
+/// The script's words, dequoted, read from the same comment-stripped code the
+/// classification and the gates read.
+///
+/// `None` when the comment scan refuses, i.e. when the two shells disagree
+/// about where a comment starts. Callers that answer a security question about
+/// the script — "could a deny rule match anything in here" — must read these
+/// words rather than the raw text: an apostrophe in a comment opens the shared
+/// lexer's quote state and swallows everything after it into one argument.
+pub(crate) fn code_words(cmd: &str) -> Option<Vec<String>> {
+    Some(lexer::shell_split(&strip_comments(cmd)?))
+}
+
 /// True for fish's `(cmd)` command substitution, which the shared lexer reads
 /// as a POSIX subshell and therefore does not refuse.
 fn contains_fish_substitution(cmd: &str) -> bool {

@@ -1,7 +1,7 @@
 //! Translates a raw shell command into its RTK-optimized equivalent.
 
 use super::decision::{self, HookDecision};
-use super::permissions::check_command;
+use super::permissions::{self, Host};
 use crate::core::user_dirs;
 use std::io::Write;
 
@@ -93,9 +93,10 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
     // rules. The in-process `rtk hook <agent>` path is host-parameterized
     // instead (`permissions::Host`). What a delegate may say about itself is
     // only who owns approval, never whose rules apply.
-    let verdict = check_command(cmd);
+    let (deny, ask, allow) = permissions::load_rules_for(Host::Claude);
+    let verdict = permissions::check_command_with_rules(cmd, &deny, &ask, &allow);
     let decided =
-        decision::ApprovalOwner::from_env().apply(decision::decide(cmd, verdict), verdict);
+        decision::ApprovalOwner::from_env().apply(decision::decide(cmd, verdict, &deny), verdict);
     if !matches!(decided, HookDecision::Deny) {
         track_tee_read(cmd);
     }

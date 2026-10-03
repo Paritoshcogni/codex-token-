@@ -99,7 +99,12 @@ disambiguator anywhere, comments excluded before anything is classified) are
 rewritten to `rtk run --shell fish -c '<script>'` (`discover/fish_script.rs`),
 with the script's own commands rewritten inside the wrap so it costs no
 savings. Like wrapper rewrites, the wrapped form is never auto-allowed — its
-strongest verdict is `Ask` — and deny rules are checked first. The wrap is
+strongest verdict is `Ask`. A deny rule keeps the wrap off entirely: because
+the wrap hands the script to a *different* shell, and fish starts commands
+where the bash-shaped segmenter does not look (the condition of an `if` or a
+`while`, the right side of `and`/`or`/`not`), every word of the script is
+treated as a possible command start and checked against the host's own deny
+rules before wrapping. The wrap is
 skipped without a resolvable `fish` binary, on Windows, or when
 `hooks.wrap_fish_scripts = false`; those cases take the decision path they
 always did.
@@ -121,7 +126,8 @@ commands. For those:
   its contents beyond the rewrite rules it applies to them — those rules are
   the one edit it makes, so the argument carries the same commands rather than
   the same bytes;
-- the verdict is `Ask`, never `Allow`, and a deny rule still wins outright;
+- the verdict is `Ask`, never `Allow`, and a deny rule keeps the wrap off
+  wherever it matches a run of words in the script, in any placement;
 - the residual exposure is a host that treats an `rtk`-prefixed command as
   pre-approved. Codex does: it renders `Ask` as a protocol-level `allow` and
   its own safe/dangerous classifiers do not unwrap `rtk` (see `hook_cmd.rs`).
