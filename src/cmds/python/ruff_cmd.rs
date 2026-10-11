@@ -333,9 +333,13 @@ pub fn filter_ruff_format(output: &str) -> String {
 
     let output_lower = output.to_lowercase();
 
-    // Check if all files are formatted
+    // Check if all files are formatted. A mixed `--output-format concise`
+    // run also names already-formatted files in its summary, so the clean
+    // conclusion is only sound when no reformatted finding appears at all.
     if files_to_format.is_empty()
         && (output_lower.contains("left unchanged") || output_lower.contains("already formatted"))
+        && !output_lower.contains("unformatted")
+        && !output_lower.contains("would be reformat")
     {
         return "Ruff format: All files formatted correctly".to_string();
     }
@@ -543,6 +547,28 @@ Would reformat: tests/test_utils.py
         assert!(result.contains("1 files need formatting"));
         assert!(result.contains("main.py"));
         assert!(!result.contains("unformatted:"));
+    }
+
+    #[test]
+    fn test_filter_ruff_format_concise_mixed_preserves_diagnostics() {
+        // Real `ruff format --check --output-format concise` (0.17.0) mixed
+        // output: the per-file lines never reach the `-->` pairing and the
+        // summary also names already-formatted files, so the clean
+        // conclusion must not fire; the diagnostics pass through.
+        let output = r#"dirty.py:1:6: unformatted: File would be reformatted
+1 file would be reformatted, 1 file already formatted"#;
+        let result = filter_ruff_format(output);
+        assert!(result.contains("dirty.py:1:6: unformatted: File would be reformatted"));
+        assert!(result.contains("1 file would be reformatted, 1 file already formatted"));
+        assert!(!result.contains("All files formatted correctly"));
+    }
+
+    #[test]
+    fn test_filter_ruff_format_concise_clean_is_summarized() {
+        // A concise all-clean run reports only "N files already formatted".
+        let output = "2 files already formatted";
+        let result = filter_ruff_format(output);
+        assert!(result.contains("All files formatted correctly"));
     }
 
     #[test]
