@@ -514,7 +514,7 @@ When a command fails, RTK saves the full unfiltered output so the LLM can recall
 
 ```
 FAILED: 2/15 tests
-[full output: rtk recall 3f9c2a81d4e7]
+[full output: rtk recall 3f9c2a81d4e7] (unfiltered; may contain sensitive data)
 ```
 
 The SQLite store keeps up to 200 outputs with a 10 MiB uncompressed per-entry
@@ -530,6 +530,8 @@ the configured recall database (`RTK_RECALL_DB` takes precedence), preserve reca
 statistics, and leave legacy tee files and tracking history alone. Explicit
 maintenance works even when new capture is disabled. Purging does not promise
 secure erasure from filesystem snapshots or backups.
+
+Recovery output may include credentials or other sensitive data omitted from the summary. Review it before sharing. Use `RTK_RECALL=0` for one command or `rtk config recall disabled` to stop future recovery storage; this does not delete existing output.
 
 Legacy `[tee]` config sections are still honored: they map to `mode = "tee"` (file-based recovery on failure/truncation), or `mode = "disabled"` if you had `enabled = false`. The former `mode = "always"` keeps its behaviour and maps to `tee_on_success = true`, which archives successful runs too. The sqlite store stays failure/truncation-driven.
 

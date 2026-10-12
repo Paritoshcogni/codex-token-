@@ -1424,8 +1424,10 @@ Quand une commande echoue (ou qu'un filtre tronque une liste), RTK sauvegarde la
 **Fonctionnement :**
 1. La commande echoue (exit code != 0) ou la sortie est tronquee
 2. RTK stocke la sortie brute (gzip) dans `~/.local/share/rtk/recall.db`
-3. Un hint avec le hash est affiche : `[full output: rtk recall <hash>]` ou `[+N hidden: rtk recall <hash>]`
+3. Un hint avec le hash est affiche : `[full output: rtk recall <hash>] (unfiltered; may contain sensitive data)` ou `[+N hidden: rtk recall <hash>] (unfiltered; may contain sensitive data)`
 4. `rtk recall <hash>` restitue la partie manquante (delta), `--full` la sortie complete
+
+La sortie recuperee, en SQLite comme dans les fichiers tee, n'est pas expurgee des donnees sensibles : un champ absent du resume peut rester dans la sauvegarde. Verifiez-la avant de la partager. `RTK_RECALL=0` ou `rtk config recall disabled` arrete les futures sauvegardes sans supprimer celles qui existent deja. Le meme avertissement suit les hints tee, apres les crochets pour conserver la commande ou le chemin entre guillemets.
 
 **Commandes :**
 ```bash
