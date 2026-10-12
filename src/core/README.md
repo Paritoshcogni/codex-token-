@@ -99,6 +99,7 @@ max_width = 120
 mode = "sqlite"             # sqlite (default) | tee (legacy files) | disabled
 max_entry_bytes = 10485760  # sqlite: 10 MiB per entry
 max_entries = 200           # sqlite: FIFO cap
+max_total_bytes = 0         # sqlite: combined encoded blobs; 0 = unlimited (legacy default)
 retention_days = 30         # sqlite: 0 disables age eviction
 compression = true          # sqlite: gzip blobs (lossless)
 # database_path = "/custom/recall.db"
@@ -208,6 +209,20 @@ For truncation recovery on **success** (e.g. a list capped at 20 items), use `te
 The agent runs `rtk recall <hash>` to get back exactly what was elided. For `force_tee_tail_hint`, `offset` is the 1-based first hidden line (`header_lines + MAX_CAP + 1`); it is stored so the default recall returns only the hidden tail. Storage is byte-faithful (`BLOB` + lossless gzip); tune limits via the `[retriever]` config section.
 
 `recall_stats` has a separate fixed 500-row cap across `(slug, mode)` pairs. An insert trigger atomically evicts the least-used row (`elisions + recalls`, then oldest `rowid`), protecting the new row; repeated upserts keep accumulating without eviction. Opening an older oversized store trims it to the same limit. This bound allows hundreds of filter/mode pairs while preventing dynamic command names from growing statistics indefinitely. Evicted counters are discarded, so [recall efficiency](../../docs/guide/analytics/gain.md#recall-efficiency) is not a lifetime total.
+
+Use `max_total_bytes = 104857600` for a 100 MiB combined encoded-payload budget.
+This counts `length(blob)` after compression, excluding SQLite pages/indexes and
+WAL/journal overhead. An oversized individual blob is rejected without a hint;
+accepted inserts and oldest-first eviction commit atomically. SQLite triggers
+maintain byte/count totals, including upserts and deletes, without summing every
+blob on each write. Existing databases initialize the totals once.
+
+`rtk recall --gc` applies age/count/byte retention and compacts SQLite;
+`rtk recall --purge` removes all payload rows and compacts SQLite. Neither creates
+an absent database nor deletes recall counters, tracking history, or tee files.
+Both honor `RTK_RECALL_DB` over `database_path` and work with capture disabled.
+Active readers can delay WAL compaction: the command reports this and suggests
+retrying `--gc`. Maintenance does not securely erase backups or snapshots.
 
 ### Truncation Caps (`truncate`)
 

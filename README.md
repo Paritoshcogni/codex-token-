@@ -517,6 +517,20 @@ FAILED: 2/15 tests
 [full output: rtk recall 3f9c2a81d4e7]
 ```
 
+The SQLite store keeps up to 200 outputs with a 10 MiB uncompressed per-entry
+cap. Entries older than 30 days are evicted on the next write or `--gc`. Set `[retriever] max_total_bytes = 104857600` for a 100 MiB combined
+stored-payload budget (gzip bytes, or raw bytes when compression is off). The
+compatibility default is `0` (no combined byte cap). Oldest entries are evicted
+first; an individual blob larger than the budget is not saved and gets no recall
+hint. The limit excludes SQLite metadata, free pages and WAL files.
+
+Run `rtk recall --gc` to apply retention now and compact the store, or
+`rtk recall --purge` to delete all stored output and compact it. Both target only
+the configured recall database (`RTK_RECALL_DB` takes precedence), preserve recall
+statistics, and leave legacy tee files and tracking history alone. Explicit
+maintenance works even when new capture is disabled. Purging does not promise
+secure erasure from filesystem snapshots or backups.
+
 Legacy `[tee]` config sections are still honored: they map to `mode = "tee"` (file-based recovery on failure/truncation), or `mode = "disabled"` if you had `enabled = false`. The former `mode = "always"` keeps its behaviour and maps to `tee_on_success = true`, which archives successful runs too. The sqlite store stays failure/truncation-driven.
 
 For the full config reference (all sections, env vars, per-project filters), see the [Configuration guide](https://www.rtk-ai.app/guide/getting-started/configuration).

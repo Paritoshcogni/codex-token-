@@ -1433,6 +1433,8 @@ rtk recall <hash>            # Partie non montree (delta)
 rtk recall <hash> --full     # Sortie complete
 rtk recall <hash> --grep RE  # Filtrer par regex
 rtk recall --list            # Lister les entrees
+rtk recall --gc              # Appliquer les limites et compacter SQLite
+rtk recall --purge           # Supprimer les sorties stockees et compacter SQLite
 rtk gain --recalls           # Taux de consultation par filtre (calibration des caps)
 rtk config recall <mode>     # Changer de mode sans editer la config (sqlite|tee|disabled)
 ```
@@ -1448,9 +1450,19 @@ qui cache des sorties que l'agent revient chercher.
 |-----------|--------|-------------|
 | `retriever.mode` | `"sqlite"` | `"sqlite"`, `"tee"` (fichiers legacy), `"disabled"` |
 | `retriever.max_entries` | `200` | Eviction FIFO au-dela |
+| `retriever.max_total_bytes` | `0` | Somme des blobs encodes (0 = sans limite globale) |
 | `retriever.retention_days` | `30` | Purge des entrees anciennes |
 | `retriever.max_entry_bytes` | `10 Mo` | Troncature au-dela (a la derniere ligne complete) |
 | Taille min | 500 octets | Les echecs trop courts ne sont pas sauvegardes |
+
+Par exemple, `max_total_bytes = 104857600` limite les blobs gzip (ou bruts sans
+compression) a 100 MiB, hors pages SQLite, index et WAL. Une entree seule trop
+grosse est refusee sans hint. `--gc` applique les limites sans attendre une
+ecriture ; `--purge` efface toutes les sorties stockees. Les deux compactent la
+base recall configuree (`RTK_RECALL_DB` prioritaire), meme si la capture est
+desactivee, sans toucher aux statistiques, au tracking ou aux fichiers tee. Les
+lecteurs actifs peuvent retarder la compaction du WAL ; relancer `--gc` ensuite.
+Aucune garantie d'effacement securise des sauvegardes ou snapshots.
 
 Le mode `"tee"` conserve l'ancien comportement (fichiers `.log` dans `~/.local/share/rtk/tee/`, rotation `tee_max_files`). Une ancienne section `[tee]` en config est automatiquement mappee (voir plus haut).
 
