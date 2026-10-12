@@ -7,7 +7,9 @@
 - TypeScript plugin using the zx library (not a shell hook)
 - Intercepts `tool.execute.before` events, calls `rtk hook opencode` as a subprocess
 - The Rust side judges the command against OpenCode's own permission rules
-  (root and project `opencode.json`/`.jsonc`, last match wins) and answers `{}`
+  (global `config.json`, `opencode.json` and `.jsonc` from
+  `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`, then project
+  `opencode.json`/`.jsonc`, last match wins) and answers `{}`
   whenever the rewrite would change the verdict those rules give — OpenCode
   evaluates the final command itself, so RTK never lifts a deny, silences an
   ask, or blocks an allow (#4195)
