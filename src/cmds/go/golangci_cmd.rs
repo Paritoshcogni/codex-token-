@@ -223,7 +223,7 @@ fn run_filtered(original_args: &[String], invocation: &RunInvocation, verbose: u
         "golangci-lint",
         &display_args(original_args),
         |output, exit_code| filter_golangci_run(output, version, exit_code),
-        crate::core::runner::RunOptions::default(),
+        crate::core::runner::RunOptions::stdout_only(),
     )?;
 
     // golangci-lint: exit 0 = clean, exit 1 = lint issues found (not an error),

@@ -672,10 +672,14 @@ fn render(
 
     if max_explicit {
         let listing = build_explicit_listing(&files, max_results);
-        let listing = listing.trim_end_matches('\n');
-        let shown = crate::core::runner::emit_guarded(listing, None, listing);
-        timer.track(track_cmd, "rtk find", raw_output, &shown);
-        return;
+        let mut listing = listing.trim_end_matches('\n').to_string();
+        if let Some(note) = &note {
+            listing.push('\n');
+            listing.push_str(note);
+        }
+        let shown = crate::core::runner::emit_guarded(&listing, None, &listing);
+        timer.track(track_cmd, &rtk_cmd, raw_output, &shown);
+        return shown;
     }
 
     let ordered = display_ordered(&files);
