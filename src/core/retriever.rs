@@ -23,6 +23,8 @@ const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub const MIN_FAILURE_BYTES: usize = 500;
 const HASH_HEX_LEN: usize = 12;
 const DEFAULT_TEE_MAX_FILES: usize = 20;
+// Capture metadata is independent of deduplicated payloads and always bounded.
+const MAX_CAPTURE_RECORDS: i64 = 1000;
 const DEFAULT_TEE_MAX_FILE_SIZE: usize = 1_048_576;
 // Fixed independently of retained output: dynamic command names must not grow
 // the statistics indefinitely. This leaves room for both modes' usual filters.
@@ -314,6 +316,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
             blob        BLOB NOT NULL,
             recalled    INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS recall_captures (
+            capture_id TEXT PRIMARY KEY,
+            invocation_id TEXT,
+            hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_recall_captures_hash ON recall_captures(hash);
         CREATE TABLE IF NOT EXISTS tee_reads (
             path TEXT PRIMARY KEY
         );
@@ -630,8 +639,10 @@ fn store_inner(
         ],
     )
     .context("insert recall row")?;
+        record_capture(&tx, &hash)?;
         bump_stat(&tx, command, "sqlite", "elisions");
         evict(&tx, cfg, &[&hash])?;
+        prune_captures(&tx)?;
         tx.commit().context("commit recall output and retention")?;
 
         Ok(StoredRef {
@@ -639,6 +650,51 @@ fn store_inner(
             hidden_lines: total_lines.saturating_sub(shown_upto.saturating_sub(1)),
         })
     })
+}
+
+fn record_capture(conn: &Connection, hash: &str) -> Result<()> {
+    if let Some(capture_id) = super::invocation::new_id() {
+        conn.execute(
+            "INSERT INTO recall_captures (capture_id, invocation_id, hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                capture_id,
+                super::invocation::current().id,
+                hash,
+                now_secs()
+            ],
+        )
+        .context("record recall capture")?;
+    }
+    Ok(())
+}
+
+fn prune_captures(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM recall_captures WHERE hash NOT IN (SELECT hash FROM recall)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM recall_captures WHERE rowid NOT IN
+         (SELECT rowid FROM recall_captures ORDER BY rowid DESC LIMIT ?1)",
+        [MAX_CAPTURE_RECORDS],
+    )?;
+    Ok(())
+}
+
+/// Count bytes actually accepted by stdout, including a partial write before an
+/// error. Token estimates use exactly those bytes, never the full stored blob.
+fn emit_recall(writer: &mut impl Write, output: &[u8]) -> (usize, std::io::Result<()>) {
+    let mut written = 0;
+    while written < output.len() {
+        match writer.write(&output[written..]) {
+            Ok(0) => return (written, Err(std::io::ErrorKind::WriteZero.into())),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return (written, Err(e)),
+        }
+    }
+    (written, writer.flush())
 }
 
 #[derive(Debug)]
@@ -786,7 +842,15 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
         return Ok(1);
     }
     let stdout = std::io::stdout();
-    let _ = stdout.lock().write_all(&out);
+    let (emitted, result) = emit_recall(&mut stdout.lock(), &out);
+    if (result.is_ok() || emitted > 0)
+        && let Ok(tracker) = super::tracking::Tracker::new()
+    {
+        // A content hash can name multiple captures, including ones already
+        // pruned. Never guess a source invocation from retained hash matches.
+        let _ = tracker.record_recall_event(emitted, None, None);
+    }
+    result.context("write recalled output")?;
     mark_recalled(&conn, &row.hash, &row.command);
 
     if row.truncated {
@@ -1296,6 +1360,90 @@ mod tests {
         let cfg = temp_cfg(dir.path());
         reset_stats_with(&cfg).unwrap();
         assert!(!cfg.database_path.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn equal_payloads_have_distinct_immutable_capture_ids() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = temp_cfg(dir.path());
+        let first = store_inner(&cfg, b"same\noutput\n", "cmd", None, 1).expect("store");
+        let second = store_inner(&cfg, b"same\noutput\n", "cmd", None, 2).expect("store");
+        assert_eq!(first.hash, second.hash);
+        let conn = open(&cfg).expect("db");
+        let distinct: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT capture_id) FROM recall_captures",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(distinct, 2);
+        let source: Option<String> = conn
+            .query_row(
+                "SELECT invocation_id FROM recall_captures LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("capture source");
+        assert_eq!(source, super::super::invocation::current().id);
+    }
+
+    #[test]
+    fn capture_metadata_is_bounded_and_prunes_payload_orphans() {
+        let conn = Connection::open_in_memory().expect("db");
+        init_schema(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO recall VALUES ('hash','cmd','',0,0,1,1,1,0,'raw',X'61',0)",
+            [],
+        )
+        .expect("payload");
+        for i in 0..MAX_CAPTURE_RECORDS + 5 {
+            conn.execute(
+                "INSERT INTO recall_captures VALUES (?1,NULL,'hash',0)",
+                [i.to_string()],
+            )
+            .expect("capture");
+        }
+        prune_captures(&conn).expect("prune");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, MAX_CAPTURE_RECORDS);
+        conn.execute("DELETE FROM recall", [])
+            .expect("delete payload");
+        prune_captures(&conn).expect("orphans");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn emission_counts_partial_and_non_utf8_bytes() {
+        struct FailsAfterThree {
+            written: usize,
+        }
+        impl Write for FailsAfterThree {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.written == 3 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let n = bytes.len().min(3 - self.written);
+                self.written += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (bytes, result) = emit_recall(&mut FailsAfterThree { written: 0 }, b"abcdef");
+        assert_eq!(bytes, 3);
+        assert!(result.is_err());
+        let mut out = Vec::new();
+        let (bytes, result) = emit_recall(&mut out, b"a\xff\n");
+        assert_eq!(bytes, 3);
+        assert!(result.is_ok());
+        assert_eq!(out, b"a\xff\n");
     }
 
     #[test]
