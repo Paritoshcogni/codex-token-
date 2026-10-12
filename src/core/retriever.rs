@@ -594,6 +594,277 @@ pub fn record_tee_recall(slug: &str, path: &str) {
     record_tee_recall_with(&cfg, slug, path);
 }
 
+/// One independently recoverable output in a batch. Offsets remain per entry;
+/// batching never combines files into an opaque, run-wide recovery blob.
+pub struct StoreInput<'a> {
+    pub content: &'a [u8],
+    pub command: &'a str,
+    pub exit_code: Option<i32>,
+    pub shown_upto: usize,
+}
+
+struct PreparedEntry<'a> {
+    input: StoreInput<'a>,
+    hash: String,
+    capture_id: String,
+    total_lines: usize,
+    shown_upto: usize,
+    truncated: bool,
+    codec: &'static str,
+    blob: Vec<u8>,
+}
+
+fn prepare_entry<'a>(cfg: &RetrieverConfig, input: StoreInput<'a>) -> Result<PreparedEntry<'a>> {
+    let content = input.content;
+    let shown_upto = input.shown_upto.max(1);
+    let cap = cfg.max_entry_bytes;
+    let cut_at_line = |slice: &[u8]| {
+        slice[..cap]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(cap)
+    };
+    // Keep the hidden tail when the cap cannot hold the already-shown prefix.
+    let (payload, shown_upto, truncated) = if content.len() <= cap {
+        (content, shown_upto, false)
+    } else if shown_upto > 1 {
+        let hidden = slice_from_line(content, shown_upto);
+        if hidden.len() > cap {
+            (&hidden[..cut_at_line(hidden)], 1, true)
+        } else {
+            (hidden, 1, true)
+        }
+    } else {
+        (&content[..cut_at_line(content)], 1, true)
+    };
+    let (blob, codec) = if cfg.compression {
+        match gzip(payload) {
+            Ok(z) => (z, "gzip"),
+            Err(_) => (payload.to_vec(), "raw"),
+        }
+    } else {
+        (payload.to_vec(), "raw")
+    };
+    Ok(PreparedEntry {
+        hash: payload_hash(input.command, payload),
+        capture_id: super::invocation::new_id().context("generate immutable recall capture ID")?,
+        total_lines: count_lines(payload),
+        input,
+        shown_upto,
+        truncated,
+        codec,
+        blob,
+    })
+}
+
+enum PreparedSlot<'a> {
+    Empty,
+    Unavailable,
+    Entry(PreparedEntry<'a>),
+}
+
+impl PreparedSlot<'_> {
+    fn entry(&self) -> Option<&PreparedEntry<'_>> {
+        match self {
+            Self::Entry(entry) => Some(entry),
+            Self::Empty | Self::Unavailable => None,
+        }
+    }
+
+    fn unavailable_result(&self) -> Stored {
+        match self {
+            Self::Empty => Stored::Empty,
+            Self::Unavailable | Self::Entry(_) => Stored::Unavailable,
+        }
+    }
+}
+
+const INSERT_RECALL: &str =
+    "INSERT INTO recall
+     (hash, command, cwd, exit_code, created_at, total_lines, shown_upto, byte_size, truncated, codec, blob)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+     ON CONFLICT(hash) DO UPDATE SET created_at = excluded.created_at";
+
+/// Store a run's outputs in one transaction, with one retention pass. Only
+/// committed rows surviving that pass are eligible for recovery hints.
+pub fn store_batch(cfg: &RetrieverConfig, inputs: &[StoreInput<'_>]) -> Vec<Stored> {
+    store_batch_inner(cfg, inputs).unwrap_or_else(|_| {
+        inputs
+            .iter()
+            .map(|input| {
+                if input.content.is_empty() {
+                    Stored::Empty
+                } else {
+                    Stored::Unavailable
+                }
+            })
+            .collect()
+    })
+}
+
+fn store_batch_inner(cfg: &RetrieverConfig, inputs: &[StoreInput<'_>]) -> Result<Vec<Stored>> {
+    // Hashing/compression and eligibility run before BEGIN so oversized entries
+    // do not block other processes or suppress eligible per-file recovery.
+    let entries: Vec<_> = inputs
+        .iter()
+        .map(|input| {
+            if input.content.is_empty() {
+                return PreparedSlot::Empty;
+            }
+            match prepare_entry(
+                cfg,
+                StoreInput {
+                    content: input.content,
+                    command: input.command,
+                    exit_code: input.exit_code,
+                    shown_upto: input.shown_upto,
+                },
+            ) {
+                Ok(entry)
+                    if cfg.max_total_bytes == 0 || entry.blob.len() <= cfg.max_total_bytes =>
+                {
+                    PreparedSlot::Entry(entry)
+                }
+                Ok(_) | Err(_) => PreparedSlot::Unavailable,
+            }
+        })
+        .collect();
+    write_batch(cfg, &entries)
+}
+
+fn write_batch(cfg: &RetrieverConfig, entries: &[PreparedSlot<'_>]) -> Result<Vec<Stored>> {
+    if !entries.iter().any(|slot| slot.entry().is_some()) {
+        return Ok(entries
+            .iter()
+            .map(PreparedSlot::unavailable_result)
+            .collect());
+    }
+    let cwd = user_dirs::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let invocation = super::invocation::current();
+    with_open(cfg, |conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("begin recall batch")?;
+        // Deduplicated payloads retain their first encoding. A smaller newly
+        // prepared blob must not make an oversized existing payload eligible.
+        let mut existing_size =
+            tx.prepare_cached("SELECT length(blob) FROM recall WHERE hash = ?1")?;
+        let eligible = entries
+            .iter()
+            .filter_map(PreparedSlot::entry)
+            .map(|entry| {
+                let fits = if cfg.max_total_bytes == 0 {
+                    true
+                } else {
+                    let retained: Option<i64> = existing_size
+                        .query_row([&entry.hash], |r| r.get(0))
+                        .optional()?;
+                    retained.map_or(entry.blob.len() <= cfg.max_total_bytes, |bytes| {
+                        bytes as u64 <= cfg.max_total_bytes as u64
+                    })
+                };
+                Ok(fits.then_some(entry))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(existing_size);
+        let eligible: Vec<_> = eligible.into_iter().flatten().collect();
+        let Some(last) = eligible.last() else {
+            return Ok(entries
+                .iter()
+                .map(PreparedSlot::unavailable_result)
+                .collect());
+        };
+        // Remove old references while their payloads are still absent, before an
+        // identical payload can be recaptured during this transaction.
+        prune_captures(&tx)?;
+        {
+            let mut insert = tx
+                .prepare_cached(INSERT_RECALL)
+                .context("prepare recall insert")?;
+            let mut capture = tx
+                .prepare_cached(
+                    "INSERT INTO recall_captures
+                 (capture_id, invocation_id, hash, created_at, command, cwd, exit_code,
+                  total_lines, shown_upto, byte_size, truncated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .context("prepare recall capture")?;
+            let created_at = now_secs();
+            for entry in &eligible {
+                insert
+                    .execute(params![
+                        entry.hash,
+                        entry.input.command,
+                        cwd,
+                        entry.input.exit_code,
+                        created_at,
+                        entry.total_lines as i64,
+                        entry.shown_upto as i64,
+                        entry.input.content.len() as i64,
+                        entry.truncated as i64,
+                        entry.codec,
+                        entry.blob,
+                    ])
+                    .context("insert recall payload")?;
+                capture
+                    .execute(params![
+                        entry.capture_id,
+                        invocation.id,
+                        entry.hash,
+                        created_at,
+                        entry.input.command,
+                        cwd,
+                        entry.input.exit_code,
+                        entry.total_lines as i64,
+                        entry.shown_upto as i64,
+                        entry.input.content.len() as i64,
+                        entry.truncated as i64,
+                    ])
+                    .context("record immutable recall capture")?;
+                bump_stat(&tx, entry.input.command, "sqlite", "elisions");
+            }
+        }
+        evict(&tx, cfg, &[&last.hash])?;
+        prune_captures(&tx)?;
+        let results = {
+            // Both caps matter: a payload can survive while this particular
+            // capture expires. Each duplicate also keeps its own exact offset.
+            let mut retained = tx
+                .prepare_cached(
+                    "SELECT c.total_lines, c.shown_upto FROM recall_captures c
+                 JOIN recall p ON p.hash = c.hash WHERE c.capture_id = ?1",
+                )
+                .context("prepare retained capture lookup")?;
+            entries
+                .iter()
+                .map(|slot| {
+                    let Some(entry) = slot.entry() else {
+                        return Ok(slot.unavailable_result());
+                    };
+                    let counts: Option<(i64, i64)> = retained
+                        .query_row([&entry.capture_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .optional()
+                        .context("verify retained recall capture")?;
+                    Ok(match counts {
+                        Some((total, shown)) => Stored::Saved(StoredRef {
+                            reference: format!("c_{}", entry.capture_id),
+                            #[cfg(test)]
+                            hash: entry.hash.clone(),
+                            hidden_lines: total.saturating_sub(shown.saturating_sub(1)).max(0)
+                                as usize,
+                        }),
+                        None => Stored::Unavailable,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        tx.commit().context("commit recall batch")?;
+        Ok(results)
+    })
+}
+
 pub fn store(
     cfg: &RetrieverConfig,
     content: &[u8],
@@ -604,7 +875,7 @@ pub fn store(
     if content.is_empty() {
         return Stored::Empty;
     }
-    match store_inner(cfg, content, command, exit_code, shown_upto.max(1)) {
+    match store_inner(cfg, content, command, exit_code, shown_upto) {
         Ok(r) => Stored::Saved(r),
         Err(_) => Stored::Unavailable,
     }
@@ -617,99 +888,16 @@ fn store_inner(
     exit_code: Option<i32>,
     shown_upto: usize,
 ) -> Result<StoredRef> {
-    let cap = cfg.max_entry_bytes;
-    let cut_at_line = |slice: &[u8]| {
-        slice[..cap]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map(|i| i + 1)
-            .unwrap_or(cap)
+    let input = StoreInput {
+        content,
+        command,
+        exit_code,
+        shown_upto,
     };
-    // Over the cap the store keeps the hidden tail rather than the prefix the
-    // agent already saw, so the hint can never promise more than recall returns.
-    let (payload, stored_shown_upto, truncated) = if content.len() <= cap {
-        (content, shown_upto, false)
-    } else if shown_upto > 1 {
-        let hidden = slice_from_line(content, shown_upto);
-        if hidden.len() > cap {
-            (&hidden[..cut_at_line(hidden)], 1, true)
-        } else {
-            (hidden, 1, true)
-        }
-    } else {
-        (&content[..cut_at_line(content)], 1, true)
-    };
-    let total_lines = count_lines(payload);
-    let shown_upto = stored_shown_upto;
-    let hash = payload_hash(command, payload);
-    let capture_id = super::invocation::new_id().context("generate immutable recall capture ID")?;
-    let invocation = super::invocation::current();
-    let (blob, codec): (Vec<u8>, &str) = if cfg.compression {
-        match gzip(payload) {
-            Ok(z) => (z, "gzip"),
-            Err(_) => (payload.to_vec(), "raw"),
-        }
-    } else {
-        (payload.to_vec(), "raw")
-    };
-    anyhow::ensure!(
-        cfg.max_total_bytes == 0 || blob.len() <= cfg.max_total_bytes,
-        "encoded recall entry exceeds the total storage budget"
-    );
-    let cwd = user_dirs::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-
-    with_open(cfg, |conn| {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-            .context("begin recall capture")?;
-        // Maintenance may have evicted payloads since the last capture. Remove
-        // their references before an identical payload can be inserted again.
-        prune_captures(&tx)?;
-        // A payload key never changes its bytes or its original metadata. The
-        // latest access time alone is refreshed for retention/LRU eviction.
-        tx.execute(
-            "INSERT INTO recall
-             (hash, command, cwd, exit_code, created_at, total_lines, shown_upto, byte_size, truncated, codec, blob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(hash) DO UPDATE SET created_at = excluded.created_at",
-            params![hash, command, cwd, exit_code, now_secs(), total_lines as i64,
-                shown_upto as i64, content.len() as i64, truncated as i64, codec, blob],
-        ).context("insert recall payload")?;
-        tx.execute(
-            "INSERT INTO recall_captures
-             (capture_id, invocation_id, hash, created_at, command, cwd, exit_code,
-              total_lines, shown_upto, byte_size, truncated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                capture_id,
-                invocation.id,
-                hash,
-                now_secs(),
-                command,
-                cwd,
-                exit_code,
-                total_lines as i64,
-                shown_upto as i64,
-                content.len() as i64,
-                truncated as i64
-            ],
-        )
-        .context("record immutable recall capture")?;
-        bump_stat(&tx, command, "sqlite", "elisions");
-        // Prune references while missing payloads are still missing. A later
-        // identical payload must never resurrect an evicted capture ID.
-        evict(&tx, cfg, &[&hash])?;
-        prune_captures(&tx)?;
-        tx.commit().context("commit recall capture")?;
-
-        Ok(StoredRef {
-            reference: format!("c_{capture_id}"),
-            #[cfg(test)]
-            hash: hash.clone(),
-            hidden_lines: total_lines.saturating_sub(shown_upto.saturating_sub(1)),
-        })
-    })
+    match store_batch_inner(cfg, &[input])?.pop() {
+        Some(Stored::Saved(stored)) => Ok(stored),
+        _ => anyhow::bail!("recall entry was not retained"),
+    }
 }
 
 fn prune_captures(conn: &Connection) -> Result<()> {
@@ -1406,6 +1594,543 @@ mod tests {
         let protected = vec![saved.hash.as_str(); 40_000];
         evict(&conn, &cfg, &protected).unwrap();
         assert!(load_by_hash(&conn, &saved.hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_batch_budget_rejects_only_oversized_slots_without_opening_empty_store() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = RetrieverConfig {
+            max_total_bytes: 8,
+            compression: false,
+            ..temp_cfg(dir.path())
+        };
+        let rejected = store_batch(
+            &cfg,
+            &[
+                batch_input(b"oversized", "large", 1),
+                batch_input(b"", "empty", 1),
+            ],
+        );
+        assert!(matches!(rejected[0], Stored::Unavailable));
+        assert!(matches!(rejected[1], Stored::Empty));
+        assert!(!db_path(&cfg).expect("path").exists());
+        let results = store_batch(
+            &cfg,
+            &[
+                batch_input(b"oversized", "first", 1),
+                batch_input(b"one\n", "accepted", 1),
+                batch_input(b"", "empty", 1),
+                batch_input(b"oversized", "last", 1),
+            ],
+        );
+        assert!(matches!(results[0], Stored::Unavailable));
+        assert!(matches!(results[2], Stored::Empty));
+        assert!(matches!(results[3], Stored::Unavailable));
+        let Stored::Saved(ref saved) = results[1] else {
+            panic!("eligible capture");
+        };
+        let conn = open(&cfg).expect("db");
+        let row = load_reference(&conn, &saved.reference)
+            .expect("lookup")
+            .expect("capture");
+        assert_eq!(decode(&row).expect("decode"), b"one\n");
+        assert_eq!(storage_totals(&conn), (1, 4));
+        assert_eq!(
+            stats_snapshot_with(&cfg)
+                .expect("stats")
+                .iter()
+                .map(|s| s.elisions)
+                .sum::<i64>(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r
+                .get::<_, i64>(0))
+                .expect("captures"),
+            1
+        );
+        let rejected = store_batch(&cfg, &[batch_input(b"oversized", "large", 1)]);
+        assert!(matches!(rejected[0], Stored::Unavailable));
+        assert_eq!(storage_totals(&conn), (1, 4));
+        assert!(
+            load_reference(&conn, &saved.reference)
+                .expect("lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_batch_total_budget_evicts_payloads_captures_and_keeps_exact_totals() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = RetrieverConfig {
+            max_entries: 0,
+            max_total_bytes: 8,
+            compression: false,
+            ..temp_cfg(dir.path())
+        };
+        let results = store_batch(
+            &cfg,
+            &[
+                batch_input(b"one\n", "one", 1),
+                batch_input(b"two\n", "two", 1),
+                batch_input(b"tri\n", "three", 1),
+            ],
+        );
+        assert!(matches!(results[0], Stored::Unavailable));
+        let conn = open(&cfg).expect("db");
+        assert_eq!(storage_totals(&conn), (2, 8));
+        for result in &results[1..] {
+            let Stored::Saved(saved) = result else {
+                panic!("retained capture");
+            };
+            assert!(
+                load_reference(&conn, &saved.reference)
+                    .expect("lookup")
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r
+                .get::<_, i64>(0))
+                .expect("captures"),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM recall_captures WHERE hash NOT IN (SELECT hash FROM recall)",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .expect("orphans"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_batch_capture_cap_does_not_advertise_expired_duplicate_references() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = RetrieverConfig {
+            max_entries: 0,
+            ..temp_cfg(dir.path())
+        };
+        let inputs: Vec<_> = (0..MAX_CAPTURE_RECORDS + 5)
+            .map(|_| batch_input(b"same\npayload\n", "same", 2))
+            .collect();
+        let results = store_batch(&cfg, &inputs);
+        assert!(
+            results[..5]
+                .iter()
+                .all(|s| matches!(s, Stored::Unavailable))
+        );
+        let conn = open(&cfg).expect("db");
+        for result in &results[5..] {
+            let Stored::Saved(saved) = result else {
+                panic!("retained capture");
+            };
+            let row = load_reference(&conn, &saved.reference)
+                .expect("lookup")
+                .expect("capture");
+            assert_eq!(saved.hidden_lines, 1);
+            assert_eq!(
+                slice_from_line(&decode(&row).expect("decode"), row.shown_upto),
+                b"payload\n"
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r
+                .get::<_, i64>(0))
+                .expect("captures"),
+            MAX_CAPTURE_RECORDS
+        );
+        assert_eq!(storage_totals(&conn).0, 1);
+    }
+
+    #[test]
+    fn test_batch_capture_insert_failure_rolls_back_payload_stats_and_totals() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = temp_cfg(dir.path());
+        let conn = open(&cfg).expect("db");
+        conn.execute_batch("CREATE TRIGGER reject_capture BEFORE INSERT ON recall_captures WHEN NEW.command = 'second' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").expect("trigger");
+        let results = store_batch(
+            &cfg,
+            &[
+                batch_input(b"first\n", "first", 1),
+                batch_input(b"second\n", "second", 1),
+            ],
+        );
+        assert!(results.iter().all(|s| matches!(s, Stored::Unavailable)));
+        assert_eq!(storage_totals(&conn), (0, 0));
+        assert!(stats_snapshot_with(&cfg).expect("stats").is_empty());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r
+                .get::<_, i64>(0))
+                .expect("captures"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_maintenance_prunes_capture_metadata_without_resurrecting_old_hints() {
+        for purge in [false, true] {
+            let dir = tempfile::tempdir().expect("directory");
+            let cfg = temp_cfg(dir.path());
+            let old = store_inner(&cfg, b"private\n", "private", None, 1).expect("capture");
+            let conn = open(&cfg).expect("db");
+            if !purge {
+                conn.execute("UPDATE recall SET created_at = 0", [])
+                    .expect("age");
+            }
+            assert_eq!(maintain_store(&cfg, purge).expect("maintenance"), 1);
+            assert_eq!(storage_totals(&conn), (0, 0));
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r
+                    .get::<_, i64>(0))
+                    .expect("captures"),
+                0
+            );
+            let new = store_inner(&cfg, b"private\n", "private", None, 1).expect("recapture");
+            assert!(
+                load_reference(&conn, &old.reference)
+                    .expect("old lookup")
+                    .is_none()
+            );
+            assert!(
+                load_reference(&conn, &new.reference)
+                    .expect("new lookup")
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn test_batched_stats_cap_composes_with_payload_and_capture_accounting() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = RetrieverConfig {
+            max_entries: 0,
+            ..temp_cfg(dir.path())
+        };
+        let commands: Vec<_> = (0..MAX_STATS_ROWS + 5)
+            .map(|i| format!("dynamic{i}"))
+            .collect();
+        let inputs: Vec<_> = commands
+            .iter()
+            .map(|command| batch_input(b"row\n", command, 1))
+            .collect();
+        let results = store_batch(&cfg, &inputs);
+        assert!(results.iter().all(|s| matches!(s, Stored::Saved(_))));
+        let conn = open(&cfg).expect("db");
+        assert_eq!(
+            stats_snapshot_with(&cfg).expect("stats").len(),
+            MAX_STATS_ROWS
+        );
+        assert_eq!(storage_totals(&conn).0, (MAX_STATS_ROWS + 5) as i64);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r
+                .get::<_, i64>(0))
+                .expect("captures"),
+            (MAX_STATS_ROWS + 5) as i64
+        );
+    }
+
+    #[test]
+    fn test_batch_budget_checks_immutable_retained_encoding_and_keeps_valid_peers() {
+        let dir = tempfile::tempdir().expect("directory");
+        let original = RetrieverConfig {
+            compression: false,
+            ..temp_cfg(dir.path())
+        };
+        let large = vec![b'x'; 4096];
+        let old = store_inner(&original, &large, "same", None, 1).expect("raw capture");
+        let bounded = RetrieverConfig {
+            compression: true,
+            max_total_bytes: 100,
+            ..original
+        };
+        assert!(gzip(&large).expect("gzip").len() < bounded.max_total_bytes);
+        let results = store_batch(
+            &bounded,
+            &[
+                batch_input(b"valid\n", "valid", 1),
+                batch_input(&large, "same", 1),
+            ],
+        );
+        let Stored::Saved(ref valid) = results[0] else {
+            panic!("valid peer must survive rejected duplicate");
+        };
+        assert!(matches!(results[1], Stored::Unavailable));
+        let conn = open(&bounded).expect("db");
+        assert!(
+            load_reference(&conn, &valid.reference)
+                .expect("valid lookup")
+                .is_some()
+        );
+        assert!(
+            load_reference(&conn, &old.reference)
+                .expect("old lookup")
+                .is_none()
+        );
+        assert!(storage_totals(&conn).1 <= bounded.max_total_bytes as i64);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r
+                .get::<_, i64>(0))
+                .expect("captures"),
+            1
+        );
+    }
+
+    fn batch_input<'a>(content: &'a [u8], command: &'a str, shown_upto: usize) -> StoreInput<'a> {
+        StoreInput {
+            content,
+            command,
+            exit_code: None,
+            shown_upto,
+        }
+    }
+
+    #[test]
+    fn test_batch_empty_never_creates_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = temp_cfg(dir.path());
+        assert!(store_batch(&cfg, &[]).is_empty());
+        assert!(matches!(
+            store_batch(&cfg, &[batch_input(b"", "empty", 1)])[0],
+            Stored::Empty
+        ));
+        assert!(!cfg.database_path.expect("path").exists());
+    }
+
+    #[test]
+    fn test_batch_rolls_back_every_row_on_insert_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = temp_cfg(dir.path());
+        let conn = open(&cfg).expect("open");
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second BEFORE INSERT ON recall
+            WHEN NEW.command = 'second' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+        )
+        .expect("trigger");
+        let stored = store_batch(
+            &cfg,
+            &[
+                batch_input(b"first\n", "first", 1),
+                batch_input(b"second\n", "second", 1),
+            ],
+        );
+        assert!(stored.iter().all(|s| matches!(s, Stored::Unavailable)));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall", [], |r| r.get::<_, i64>(0))
+                .expect("count"),
+            0
+        );
+        assert!(stats_snapshot_with(&cfg).expect("stats").is_empty());
+        conn.execute_batch("DROP TRIGGER reject_second;")
+            .expect("drop trigger");
+        assert!(
+            matches!(store(&cfg, b"next\n", "next", None, 1), Stored::Saved(_)),
+            "failed batch must release its transaction"
+        );
+    }
+
+    #[test]
+    fn test_batch_rolls_back_when_retention_cannot_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = RetrieverConfig {
+            max_entries: 1,
+            ..temp_cfg(dir.path())
+        };
+        let conn = open(&cfg).expect("open");
+        conn.execute_batch(
+            "CREATE TRIGGER reject_delete BEFORE DELETE ON recall
+            BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+        )
+        .expect("trigger");
+        let stored = store_batch(
+            &cfg,
+            &[
+                batch_input(b"first\n", "first", 1),
+                batch_input(b"second\n", "second", 1),
+            ],
+        );
+        assert!(stored.iter().all(|s| matches!(s, Stored::Unavailable)));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall", [], |r| r.get::<_, i64>(0))
+                .expect("count"),
+            0
+        );
+        assert!(stats_snapshot_with(&cfg).expect("stats").is_empty());
+    }
+
+    #[test]
+    fn test_batch_returns_only_retained_captures_with_original_offsets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = RetrieverConfig {
+            max_entries: 2,
+            ..temp_cfg(dir.path())
+        };
+        let stored = store_batch(
+            &cfg,
+            &[
+                batch_input(b"old\n", "old", 1),
+                batch_input(b"shown\nhidden\ntail\n", "duplicate", 1),
+                batch_input(b"new\n", "new", 1),
+                batch_input(b"shown\nhidden\ntail\n", "duplicate", 3),
+            ],
+        );
+        assert!(matches!(stored[0], Stored::Unavailable));
+        let conn = open(&cfg).expect("open");
+        for (index, expected) in [(1, 3), (2, 1), (3, 1)] {
+            let Stored::Saved(ref saved) = stored[index] else {
+                panic!("retained entry");
+            };
+            let row = load_reference(&conn, &saved.reference)
+                .expect("read")
+                .expect("row");
+            assert_eq!(saved.hidden_lines, expected);
+            assert_eq!(
+                count_lines(slice_from_line(
+                    &decode(&row).expect("decode"),
+                    row.shown_upto
+                )),
+                expected
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall", [], |r| r.get::<_, i64>(0))
+                .expect("count"),
+            2
+        );
+    }
+
+    #[test]
+    fn test_batch_preserves_caps_codecs_offsets_and_bytes() {
+        for compression in [false, true] {
+            for cap in [0, 5, 12, 1024] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let cfg = RetrieverConfig {
+                    compression,
+                    max_entry_bytes: cap,
+                    ..temp_cfg(dir.path())
+                };
+                let inputs = [
+                    batch_input(b"seen\nhidden\n\xff\x00tail\n", "one", 2),
+                    batch_input(b"hello\r\nno-eol", "two", 0),
+                    batch_input(b"", "empty", 1),
+                ];
+                let stored = store_batch(&cfg, &inputs);
+                assert!(matches!(stored[2], Stored::Empty));
+                let conn = open(&cfg).expect("open");
+                for (input, result) in inputs.iter().zip(stored).take(2) {
+                    let Stored::Saved(saved) = result else {
+                        panic!("stored");
+                    };
+                    let row = load_reference(&conn, &saved.reference)
+                        .expect("read")
+                        .expect("row");
+                    let bytes = decode(&row).expect("decode");
+                    assert!(bytes.len() <= cap);
+                    assert_eq!(
+                        saved.hidden_lines,
+                        count_lines(slice_from_line(&bytes, row.shown_upto))
+                    );
+                    assert_eq!(row.codec, if compression { "gzip" } else { "raw" });
+                    if cap >= input.content.len() {
+                        assert_eq!(bytes, input.content);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_concurrent_writers_commit_complete_batches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = temp_cfg(dir.path());
+        // Initialize before racing writers so this exercises writer transactions
+        // independently of schema creation.
+        drop(open(&cfg).expect("initialize"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|writer| {
+                let cfg = cfg.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let commands: Vec<_> = (0..20).map(|i| format!("grep_{writer}_{i}")).collect();
+                    let inputs: Vec<_> = commands
+                        .iter()
+                        .map(|c| batch_input(b"seen\nhidden\n", c, 2))
+                        .collect();
+                    barrier.wait();
+                    let results = store_batch(&cfg, &inputs);
+                    assert!(results.iter().all(|s| matches!(s, Stored::Saved(_))));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer");
+        }
+        let conn = open(&cfg).expect("open");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recall", [], |r| r.get::<_, i64>(0))
+                .expect("count"),
+            80
+        );
+        assert_eq!(
+            stats_snapshot_with(&cfg)
+                .expect("stats")
+                .iter()
+                .map(|s| s.elisions)
+                .sum::<i64>(),
+            80
+        );
+    }
+
+    #[test]
+    #[ignore = "manual timing: cargo test --release --bin rtk test_benchmark_recall_batch_phases -- --ignored --nocapture"]
+    fn test_benchmark_recall_batch_phases() {
+        let payloads: Vec<_> = (0..100).map(|file| (0..80)
+            .map(|line| format!("corpus/file_{file:04}.txt:{line}:needle file={file:04} line={line:04} deterministic search benchmark payload\n"))
+            .collect::<String>()).collect();
+        let commands: Vec<_> = (0..100).map(|i| format!("grep_{i}_file")).collect();
+        for compression in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = RetrieverConfig {
+                compression,
+                ..temp_cfg(dir.path())
+            };
+            let mut prepare_us = Vec::new();
+            let mut write_us = Vec::new();
+            for iteration in 0..23 {
+                let start = std::time::Instant::now();
+                let entries: Vec<_> = payloads
+                    .iter()
+                    .zip(&commands)
+                    .map(|(body, command)| {
+                        PreparedSlot::Entry(
+                            prepare_entry(&cfg, batch_input(body.as_bytes(), command, 26))
+                                .expect("prepare"),
+                        )
+                    })
+                    .collect();
+                let prepared = start.elapsed().as_micros();
+                let start = std::time::Instant::now();
+                assert!(
+                    write_batch(&cfg, &entries)
+                        .expect("batch")
+                        .iter()
+                        .all(|s| matches!(s, Stored::Saved(_)))
+                );
+                if iteration >= 3 {
+                    prepare_us.push(prepared);
+                    write_us.push(start.elapsed().as_micros());
+                }
+            }
+            prepare_us.sort_unstable();
+            write_us.sort_unstable();
+            eprintln!(
+                "100-file batch compression={compression}: preparation median={} us; transaction median={} us",
+                prepare_us[10], write_us[10]
+            );
+        }
     }
 
     #[test]

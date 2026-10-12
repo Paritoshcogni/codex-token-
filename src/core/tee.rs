@@ -85,29 +85,81 @@ pub fn force_tee_hint(content: &str, command_slug: &str) -> Option<String> {
     }
 }
 
+/// A tail to recover independently, even when several tails share one write.
+pub struct TailHint<'a> {
+    pub content: &'a str,
+    pub command_slug: &'a str,
+    pub line_offset: usize,
+}
+
 pub fn force_tee_tail_hint(
     content: &str,
     command_slug: &str,
     line_offset: usize,
 ) -> Option<String> {
-    if content.is_empty() {
-        return None;
+    force_tee_tail_hints(&[TailHint {
+        content,
+        command_slug,
+        line_offset,
+    }])
+    .pop()
+    .flatten()
+}
+
+/// Resolve configuration once, batch SQLite writes, then format only committed
+/// references. Tee mode retains its existing per-file storage semantics.
+pub fn force_tee_tail_hints(tails: &[TailHint<'_>]) -> Vec<Option<String>> {
+    if tails.iter().all(|tail| tail.content.is_empty()) {
+        return tails.iter().map(|_| None).collect();
     }
-    let (mode, cfg) = active()?;
+    let Some((mode, cfg)) = active() else {
+        return tails.iter().map(|_| None).collect();
+    };
+    force_tee_tail_hints_with(mode, &cfg, tails)
+}
+
+fn force_tee_tail_hints_with(
+    mode: RecoveryMode,
+    cfg: &RetrieverConfig,
+    tails: &[TailHint<'_>],
+) -> Vec<Option<String>> {
     match mode {
-        RecoveryMode::Disabled => None,
-        RecoveryMode::Tee => {
-            super::tee_file::force_tee_tail_hint(&cfg, content, command_slug, line_offset)
-                .inspect(|_| retriever::record_tee_elision(&cfg, command_slug))
-        }
+        RecoveryMode::Disabled => tails.iter().map(|_| None).collect(),
+        RecoveryMode::Tee => tails
+            .iter()
+            .map(|tail| {
+                if tail.content.is_empty() {
+                    return None;
+                }
+                super::tee_file::force_tee_tail_hint(
+                    cfg,
+                    tail.content,
+                    tail.command_slug,
+                    tail.line_offset,
+                )
+                .inspect(|_| retriever::record_tee_elision(cfg, tail.command_slug))
+            })
+            .collect(),
         RecoveryMode::Sqlite => {
-            match retriever::store(&cfg, content.as_bytes(), command_slug, None, line_offset) {
-                Stored::Saved(s) if s.hidden_lines > 0 => Some(format!(
-                    "[+{} hidden: rtk recall {}]{RECOVERY_OUTPUT_NOTICE}",
-                    s.hidden_lines, s.reference
-                )),
-                Stored::Saved(_) | Stored::Unavailable | Stored::Empty => None,
-            }
+            let inputs: Vec<_> = tails
+                .iter()
+                .map(|tail| retriever::StoreInput {
+                    content: tail.content.as_bytes(),
+                    command: tail.command_slug,
+                    exit_code: None,
+                    shown_upto: tail.line_offset,
+                })
+                .collect();
+            retriever::store_batch(cfg, &inputs)
+                .into_iter()
+                .map(|stored| match stored {
+                    Stored::Saved(s) if s.hidden_lines > 0 => Some(format!(
+                        "[+{} hidden: rtk recall {}]{RECOVERY_OUTPUT_NOTICE}",
+                        s.hidden_lines, s.reference
+                    )),
+                    Stored::Saved(_) | Stored::Unavailable | Stored::Empty => None,
+                })
+                .collect()
         }
     }
 }
