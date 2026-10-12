@@ -145,6 +145,56 @@ fn read_stdin_python_shebang_uses_python_filter() {
     assert_eq!(output.stdout, b"x = 1");
 }
 
+#[test]
+fn read_stdin_es_module_private_field_keeps_lines() {
+    let input = b"\
+import fs from 'node:fs';
+class Example {
+  #value = 7;
+  read() { return this.#value; }
+}
+console.log(new Example().read());
+";
+    let output = read_stdin(input, &["--level", "minimal"]);
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"\
+import fs from 'node:fs';
+class Example {
+  #value = 7;
+  read() { return this.#value; }
+}
+console.log(new Example().read());"
+    );
+}
+
+#[test]
+fn read_stdin_template_heading_keeps_lines() {
+    let input = b"\
+import fs from 'node:fs';
+const text = `
+# important heading
+body
+`;
+console.log(text);
+";
+    let output = read_stdin(input, &["--level", "minimal"]);
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"\
+import fs from 'node:fs';
+const text = `
+# important heading
+body
+`;
+console.log(text);"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rewritten_head_spellings_match_native_on_non_utf8_files() {
