@@ -29,6 +29,7 @@ mod codex;
 mod copilot;
 mod cursor;
 mod droid;
+mod forge;
 mod gemini;
 mod hermes;
 mod instructions_agents;
@@ -60,6 +61,7 @@ pub use antigravity::{run_antigravity_mode, uninstall_antigravity_mode};
 pub(crate) use copilot::{COPILOT_HOOK_JSON, copilot_user_dir};
 pub use copilot::{run_copilot, run_copilot_global, uninstall_copilot, uninstall_copilot_global};
 pub use droid::{run_droid_mode, uninstall_droid};
+pub use forge::{run_forge_mode, uninstall_forge};
 pub use gemini::run_gemini;
 pub use hermes::{run_hermes_mode, uninstall_hermes};
 pub use instructions_agents::{run_kilocode_mode, run_kimi_mode};
@@ -1660,6 +1662,8 @@ fn show_claude_config() -> Result<()> {
     println!("  rtk init -g --hook-only     # Hook only, no RTK.md");
     println!("  rtk init --codex            # Configure local AGENTS.md + RTK.md + hooks.json");
     println!("  rtk init -g --codex         # Configure global AGENTS.md + RTK.md + hooks.json");
+    println!("  rtk init --agent forge     # Forge: RTK block in local AGENTS.md");
+    println!("  rtk init -g --agent forge  # Forge: RTK block in ~/.forge/AGENTS.md");
     println!("  rtk init -g --opencode      # Claude setup + OpenCode plugin");
     println!("  rtk init -g --agent cursor  # Install Cursor Agent hooks");
 
