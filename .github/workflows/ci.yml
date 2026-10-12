@@ -73,11 +73,11 @@ jobs:
         with:
           fetch-depth: 0
       # The OpenCode plugin is TypeScript and ships as a file, not as a cargo
-      # artifact, so `cargo test` never touches it. Node 22.18+ strips the types
+      # artifact, so `cargo test` never touches it. Node strips the types
       # without a loader, and the test mocks rtk, so no build is needed here.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
       - run: node --test hooks/opencode/rtk.test.mjs
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
