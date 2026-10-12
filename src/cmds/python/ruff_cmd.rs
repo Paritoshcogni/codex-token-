@@ -1,5 +1,8 @@
 //! Filters Ruff linter and formatter output.
 
+use crate::core::arg_tokenizer::{
+    Dialect, TokenKind, ValueSpec, before_dashdash, dashdash_index, tokenize_grammar,
+};
 use crate::core::config;
 use crate::core::runner;
 use crate::core::shell::display_args;
@@ -51,7 +54,6 @@ struct RuffDiagnostic {
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let route = route_ruff_args(args);
     let is_check = matches!(route, RuffRoute::Check { .. });
-    let is_format = matches!(route, RuffRoute::Subcommand { at } if args[at] == "format");
 
     let mut cmd = resolved_command("ruff");
 
@@ -60,12 +62,6 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         .iter()
         .any(|a| a == "--output-format" || a.starts_with("--output-format="));
 
-    let user_json_format = args.iter().enumerate().any(|(i, a)| {
-        a == "--output-format=json"
-            || (a == "--output-format" && args.get(i + 1).is_some_and(|n| n == "json"))
-    });
-    let use_json_filter = !user_set_output_format || user_json_format;
-    // `[]` is a clean run only when rtk chose the format; a user who asked for JSON gets `[]` back.
     let clean_outputs: &[&str] = if is_check && !user_set_output_format {
         &["[]"]
     } else {
@@ -80,28 +76,96 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         eprintln!("Running: ruff {}", args.join(" "));
     }
 
+    let owned_args = args.to_vec();
     runner::run_filtered(
         cmd,
         "ruff",
         &display_args(args),
-        move |stdout| {
-            if is_check && use_json_filter && !stdout.trim().is_empty() {
-                filter_ruff_check_json(stdout)
-            } else if is_format {
-                filter_ruff_format(stdout)
-            } else {
-                truncate(stdout.trim(), config::limits().passthrough_max_chars)
-            }
-        },
+        move |stdout| filter_ruff_output(&owned_args, stdout),
         runner::RunOptions::stdout_only().clean_outputs(clean_outputs),
     )
 }
 
-/// Ruff global options that consume the next token as their value
-/// (`ruff --help`, 0.17: only `--config` and `--color`). Every other global
-/// token is a flag; rule-selection options belong to the subcommand and only
+/// Choose the output treatment for a routed invocation: check runs get the
+/// JSON summary, format runs the format summary, help and version requests
+/// stay complete, and everything else is a bounded passthrough.
+fn filter_ruff_output(args: &[String], stdout: &str) -> String {
+    let route = route_ruff_args(args);
+    let is_check = matches!(route, RuffRoute::Check { .. });
+    let is_format = matches!(route, RuffRoute::Subcommand { at } if args[at] == "format");
+    let trimmed = stdout.trim();
+
+    let user_set_output_format = args
+        .iter()
+        .any(|a| a == "--output-format" || a.starts_with("--output-format="));
+    let user_json_format = args.iter().enumerate().any(|(i, a)| {
+        a == "--output-format=json"
+            || (a == "--output-format" && args.get(i + 1).is_some_and(|n| n == "json"))
+    });
+    let use_json_filter = !user_set_output_format || user_json_format;
+
+    if is_check && use_json_filter && !trimmed.is_empty() {
+        filter_ruff_check_json(stdout)
+    } else if is_format {
+        filter_ruff_format(stdout)
+    } else if ruff_output_is_complete(route, args) {
+        // Help and version output are complete documentation: raw Ruff
+        // returns every byte, and so does rtk.
+        trimmed.to_string()
+    } else {
+        truncate(trimmed, config::limits().passthrough_max_chars)
+    }
+}
+
+/// Help and version requests must keep their full stdout.
+fn ruff_output_is_complete(route: RuffRoute, args: &[String]) -> bool {
+    match route {
+        RuffRoute::TopLevel => true,
+        RuffRoute::Subcommand { at } => matches!(args[at].as_str(), "help" | "version"),
+        RuffRoute::Check { .. } => false,
+    }
+}
+
+/// Route an invocation through the shared tokenizer, consuming the values of
+/// ruff's value-taking global options so an option value is never mistaken
+/// for the subcommand or a path.
+fn route_ruff_args(args: &[String]) -> RuffRoute {
+    let tokens = tokenize_grammar(args, &ruff_takes_value, Dialect::Posix);
+    for token in before_dashdash(&tokens) {
+        if !token.is_free_positional() {
+            continue;
+        }
+        // The first free positional decides: a known subcommand routes,
+        // anything else is a path and the invocation is an implicit check.
+        if RUFF_SUBCOMMANDS.contains(&token.text) {
+            if token.text == "check" {
+                return RuffRoute::Check {
+                    explicit_at: Some(token.source_index),
+                };
+            }
+            return RuffRoute::Subcommand {
+                at: token.source_index,
+            };
+        }
+        return RuffRoute::Check { explicit_at: None };
+    }
+    // No free positional before the `--` boundary: a path after it keeps the
+    // run an implicit check, because everything past the boundary is a path.
+    if dashdash_index(&tokens).is_some() && tokens.iter().any(|t| t.is_free_positional()) {
+        return RuffRoute::Check { explicit_at: None };
+    }
+    top_level_request(args)
+}
+
+/// Ruff's only global options that consume a separate value
+/// (`ruff --help`, 0.17: `--config` and `--color`). Every other global token
+/// is a flag; rule-selection options belong to the subcommand and only
 /// appear once the routing decision has been made.
 const RUFF_GLOBAL_VALUE_OPTIONS: &[&str] = &["config", "color"];
+
+fn ruff_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    (kind == TokenKind::Long && RUFF_GLOBAL_VALUE_OPTIONS.contains(&name)).then(ValueSpec::value)
+}
 
 /// How an invocation routes once global option values are consumed.
 #[derive(Clone, Copy, Debug)]
@@ -113,48 +177,6 @@ enum RuffRoute {
     Subcommand { at: usize },
     /// No subcommand and no path: a top-level request such as `--version`.
     TopLevel,
-}
-
-/// Scan the pre-subcommand tokens, consuming the values of global options, so
-/// an option value is never mistaken for the subcommand or a path.
-fn route_ruff_args(args: &[String]) -> RuffRoute {
-    let mut i = 0;
-    while i < args.len() {
-        let token = args[i].as_str();
-        if token == "--" {
-            // Only paths follow the separator; any path keeps implicit check.
-            return if i + 1 < args.len() {
-                RuffRoute::Check { explicit_at: None }
-            } else {
-                top_level_request(args)
-            };
-        }
-        if let Some(long) = token.strip_prefix("--") {
-            let name = long.split('=').next().unwrap_or(long);
-            i += if long.contains('=') || !RUFF_GLOBAL_VALUE_OPTIONS.contains(&name) {
-                1
-            } else {
-                2
-            };
-            continue;
-        }
-        if token.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        // The first bare token decides: a known subcommand routes, anything
-        // else is a path and the invocation is an implicit `ruff check`.
-        if RUFF_SUBCOMMANDS.contains(&token) {
-            if token == "check" {
-                return RuffRoute::Check {
-                    explicit_at: Some(i),
-                };
-            }
-            return RuffRoute::Subcommand { at: i };
-        }
-        return RuffRoute::Check { explicit_at: None };
-    }
-    top_level_request(args)
 }
 
 /// Flag-only invocations stay top-level for `--version`/`--help`; every other
@@ -315,7 +337,7 @@ pub fn filter_ruff_check_json(output: &str) -> String {
     }
     if violation_lines.len() > MAX_VIOLATIONS {
         result.push_str(&format!(
-            "  … +{} more\n",
+            "  â€¦ +{} more\n",
             violation_lines.len() - MAX_VIOLATIONS
         ));
         let full: String = violation_lines.concat();
@@ -614,7 +636,7 @@ Would reformat: tests/test_utils.py
             .count();
         assert!(listed <= 50, "violations cap not enforced: got {listed}");
         assert!(
-            result.contains("… +150 more"),
+            result.contains("â€¦ +150 more"),
             "missing '+N more' indicator"
         );
 
@@ -773,5 +795,50 @@ Would reformat: tests/test_utils.py
             route_ruff_args(&owned(&["format.py"])),
             RuffRoute::Check { explicit_at: None }
         ));
+    }
+
+    #[test]
+    fn ruff_help_and_version_output_stay_complete() {
+        // Pin the stdout bytes: help output longer than the bounded
+        // passthrough must come back exactly as ruff printed it.
+        let max_chars = config::limits().passthrough_max_chars;
+        let help = "usage: ruff help\n".repeat(max_chars);
+        assert_eq!(
+            filter_ruff_output(&owned(&["help", "format"]), &help),
+            help.trim()
+        );
+        assert_eq!(filter_ruff_output(&owned(&["version"]), &help), help.trim());
+        assert_eq!(
+            filter_ruff_output(&owned(&["--version"]), &help),
+            help.trim()
+        );
+        assert_eq!(
+            filter_ruff_output(&owned(&["--config", "ruff.toml", "--help"]), &help),
+            help.trim()
+        );
+    }
+
+    #[test]
+    fn ruff_other_subcommands_keep_the_bounded_passthrough() {
+        let max_chars = config::limits().passthrough_max_chars;
+        let long = "rule F401: ".repeat(max_chars);
+        let out = filter_ruff_output(&owned(&["rule", "F401"]), &long);
+        assert!(out.len() < long.len());
+        assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn ruff_output_filter_selects_by_route() {
+        // Check runs keep the JSON summary.
+        let json = r#"[{"code":"F401","message":"`os` imported but unused","location":{"row":1,"column":1},"end_location":{"row":1,"column":9},"filename":"dirty.py","fix":null}]"#;
+        assert!(filter_ruff_output(&owned(&["check", "dirty.py"]), json).contains("F401"));
+        // The format filter still serves effective format subcommands
+        // (pre-0.16 wording; the ruff >= 0.16 shapes are #3965's scope).
+        let mixed =
+            "Would reformat: dirty.py\n2 files would be reformatted, 3 files left unchanged";
+        assert!(
+            filter_ruff_output(&owned(&["format", "--check", "dirty.py"]), mixed)
+                .contains("1 files need formatting")
+        );
     }
 }
