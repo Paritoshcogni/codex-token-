@@ -1411,17 +1411,27 @@ mod tests {
                 let cfg = &cfg;
                 let barrier = &barrier;
                 scope.spawn(move || {
-                    let conn = open(cfg).expect("open worker connection");
+                    let mut conn = open(cfg).expect("open worker connection");
+                    // Exercise competing writers without thousands of durable
+                    // autocommits exhausting the production best-effort timeout
+                    // on slower Windows runners. Retention must compose with a
+                    // caller-owned transaction and preserve its committed counts.
+                    conn.busy_timeout(std::time::Duration::from_secs(60))
+                        .expect("set test contention timeout");
                     barrier.wait();
+                    let tx = conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .expect("serialize worker transaction");
                     for i in 0..MAX_STATS_ROWS / 2 {
                         for mode in ["sqlite", "tee"] {
-                            bump_stat(&conn, "cargo_test", mode, "elisions");
-                            bump_stat(&conn, "cargo_test", mode, "recalls");
+                            bump_stat(&tx, "cargo_test", mode, "elisions");
+                            bump_stat(&tx, "cargo_test", mode, "recalls");
                         }
                         let slug = format!("cargo_taskw{worker}x{i}");
-                        bump_stat(&conn, &slug, "sqlite", "elisions");
-                        assert!(stats_count(&conn) <= MAX_STATS_ROWS);
+                        bump_stat(&tx, &slug, "sqlite", "elisions");
+                        assert!(stats_count(&tx) <= MAX_STATS_ROWS);
                     }
+                    tx.commit().expect("commit worker statistics");
                 });
             }
         });
