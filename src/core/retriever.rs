@@ -364,9 +364,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE recall ADD COLUMN recalled INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Serialize first-open migrations before checking columns. Concurrent RTK
+    // processes can otherwise both observe a missing column and race ALTER.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("begin recall capture migration")?;
     // Accounting-only captures predate stable hints. Do not reconstruct their
     // snapshot from a mutable legacy row: missing metadata stays unknown.
-    let columns: Vec<String> = conn
+    let columns: Vec<String> = tx
         .prepare("PRAGMA table_info(recall_captures)")?
         .query_map([], |row| row.get(1))?
         .collect::<rusqlite::Result<_>>()?;
@@ -380,13 +384,14 @@ fn init_schema(conn: &Connection) -> Result<()> {
         ("truncated", "INTEGER"),
     ] {
         if !columns.iter().any(|column| column == name) {
-            conn.execute(
+            tx.execute(
                 &format!("ALTER TABLE recall_captures ADD COLUMN {name} {kind}"),
                 [],
             )
             .with_context(|| format!("add recall capture {name}"))?;
         }
     }
+    tx.commit().context("commit recall capture migration")?;
     init_stats_retention(conn)?;
     init_storage_accounting(conn)
 }
@@ -1770,6 +1775,41 @@ mod tests {
             )
             .expect("old capture");
         assert_eq!(old_count, 1);
+    }
+
+    #[test]
+    fn migration_serializes_concurrent_accounting_schema_openers() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = temp_cfg(dir.path());
+        let conn = open(&cfg).expect("db");
+        conn.execute_batch(
+            "DROP TABLE recall_captures;
+            CREATE TABLE recall_captures (capture_id TEXT PRIMARY KEY, invocation_id TEXT,
+                                         hash TEXT NOT NULL, created_at INTEGER NOT NULL);",
+        )
+        .expect("old schema");
+        drop(conn);
+        let path = cfg.database_path.expect("path");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let conn = Connection::open(path).expect("open thread db");
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .expect("busy timeout");
+                    barrier.wait();
+                    init_schema(&conn).map_err(|error| format!("{error:#}"))
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread
+                .join()
+                .expect("thread")
+                .unwrap_or_else(|error| panic!("simultaneous migration must succeed: {error}"));
+        }
     }
 
     #[test]
