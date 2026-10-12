@@ -226,6 +226,8 @@ Both honor `RTK_RECALL_DB` over `database_path` and work with capture disabled.
 Active readers can delay WAL compaction: the command reports this and suggests
 retrying `--gc`. Maintenance does not securely erase backups or snapshots.
 
+`rtk telemetry forget` clears both recovery backends, including when recovery is disabled. Each backend owns its cleanup and reuses its write-path resolver: the recall database and SQLite sidecars are removed without opening a new store; legacy tee cleanup removes only top-level `<epoch>_<sanitized-slug>.log` files, preserving other files and directories. Cleanup errors are reported as failures; file symlinks are not followed.
+
 ### Truncation Caps (`truncate`)
 
 `src/core/truncate.rs` defines four global cap policies — `CAP_ERRORS`, `CAP_WARNINGS`, `CAP_LIST`, `CAP_INVENTORY` — for the data classes RTK filters truncate. Each filter binds the right CAP to a local `const MAX_*` so the cap is one named jump away from the call site. These CAPs are the staging point for filter-level cap configuration (planned, not yet implemented): once the config surface lands, overriding `CAP_LIST` in `~/.config/rtk/config.toml` will tune every list filter in one place instead of editing 20+ files.

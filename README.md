@@ -581,7 +581,7 @@ All data is **aggregate counts or anonymized command names** (first 3 words, no 
 rtk telemetry status     # Check current consent state
 rtk telemetry enable     # Give consent (interactive prompt)
 rtk telemetry disable    # Withdraw consent — stops all collection immediately
-rtk telemetry forget     # Withdraw consent + delete all local data + request server-side erasure
+rtk telemetry forget     # Withdraw consent + delete telemetry/history/recovery data + request server erasure
 ```
 
 **Override via environment:**

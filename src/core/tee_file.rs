@@ -112,6 +112,69 @@ fn get_tee_dir(cfg: &RetrieverConfig) -> Option<PathBuf> {
     super::user_dirs::data().map(|d| d.join("tee"))
 }
 
+/// Remove RTK's legacy spool files, preserving the directory and its other contents.
+pub(crate) fn forget(cfg: &RetrieverConfig) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let Some(dir) = get_tee_dir(cfg) else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("Read tee spool {}", dir.display())),
+    };
+    let mut errors = Vec::new();
+    for entry in entries {
+        if let Err(e) = entry.map_err(anyhow::Error::from).and_then(forget_entry) {
+            errors.push(format!("{e:#}"));
+        }
+    }
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
+}
+
+fn forget_entry(entry: std::fs::DirEntry) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let name = entry.file_name();
+    let Some((epoch, slug)) = name
+        .to_str()
+        .and_then(|s| s.strip_suffix(".log"))
+        .and_then(|s| s.split_once('_'))
+    else {
+        return Ok(());
+    };
+    // Match write_tee_file, including old unshortened slugs. A custom tee
+    // directory can hold unrelated .log files, so extension alone is unsafe.
+    if epoch.parse::<u64>().is_err()
+        || !epoch.bytes().all(|b| b.is_ascii_digit())
+        || !slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Ok(());
+    }
+    let path = entry.path();
+    let kind = entry
+        .file_type()
+        .with_context(|| format!("Inspect {}", path.display()))?;
+    anyhow::ensure!(
+        !kind.is_symlink(),
+        "Refusing to follow tee log symlink: {}",
+        path.display()
+    );
+    if kind.is_file() {
+        // nosemgrep: filesystem-deletion
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("Delete {}", path.display())),
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_old_files(dir: &Path, max_files: usize) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .ok()
@@ -287,6 +350,83 @@ mod tests {
     use std::fs;
 
     const MAX_FILE_SIZE: usize = 1_048_576;
+
+    #[test]
+    fn test_forget_only_removes_top_level_tee_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            tee_directory: Some(dir.path().to_path_buf()),
+            ..RetrieverConfig::default()
+        };
+        let written = write(&cfg, "private output", "cargo test").unwrap();
+        // Old versions accepted arbitrarily long sanitized slugs.
+        let legacy = dir
+            .path()
+            .join(format!("1700000000_{}.log", "x".repeat(100)));
+        std::fs::write(&legacy, "legacy output").unwrap();
+        for name in [
+            "notes.log",
+            "1234_report final.log",
+            "_cmd.log",
+            "12_cmd.txt",
+            "-123_cmd.log",
+            "18446744073709551616_cmd.log",
+        ] {
+            std::fs::write(dir.path().join(name), "keep").unwrap();
+        }
+        let nested = dir.path().join("1234_directory.log");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("1234_cmd.log"), "keep").unwrap();
+        forget(&cfg).unwrap();
+        assert!(!written.exists());
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 7);
+        assert!(nested.join("1234_cmd.log").exists());
+        forget(&cfg).unwrap();
+    }
+
+    #[test]
+    fn test_forget_missing_spool_does_not_create_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            tee_directory: Some(dir.path().join("missing")),
+            ..RetrieverConfig::default()
+        };
+        forget(&cfg).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_forget_honors_tee_environment_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            tee_directory: Some(dir.path().join("configured")),
+            ..RetrieverConfig::default()
+        };
+        let configured = write(&cfg, "keep", "cmd").unwrap();
+        let overridden = dir.path().join("overridden");
+        user_env::with_path("RTK_TEE_DIR", Some(&overridden), || {
+            let written = write(&cfg, "forget", "cmd").unwrap();
+            forget(&cfg).unwrap();
+            assert!(!written.exists());
+        });
+        assert!(configured.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_forget_does_not_follow_log_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            tee_directory: Some(dir.path().to_path_buf()),
+            ..RetrieverConfig::default()
+        };
+        let target = dir.path().join("unrelated");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("1234_cmd.log")).unwrap();
+        assert!(forget(&cfg).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep");
+    }
 
     #[test]
     fn test_sanitize_slug() {
