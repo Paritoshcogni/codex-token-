@@ -26,7 +26,7 @@ fn store_hint(
     match retriever::store(cfg, content.as_bytes(), slug, exit_code, 1) {
         Stored::Saved(s) => Some(format!(
             "[full output: rtk recall {}]{RECOVERY_OUTPUT_NOTICE}",
-            s.hash
+            s.reference
         )),
         Stored::Unavailable | Stored::Empty => None,
     }
@@ -104,7 +104,7 @@ pub fn force_tee_tail_hint(
             match retriever::store(&cfg, content.as_bytes(), command_slug, None, line_offset) {
                 Stored::Saved(s) if s.hidden_lines > 0 => Some(format!(
                     "[+{} hidden: rtk recall {}]{RECOVERY_OUTPUT_NOTICE}",
-                    s.hidden_lines, s.hash
+                    s.hidden_lines, s.reference
                 )),
                 Stored::Saved(_) | Stored::Unavailable | Stored::Empty => None,
             }
@@ -148,7 +148,10 @@ mod tests {
                         let hash = recovery
                             .strip_prefix(prefix)
                             .expect("unchanged hint prefix");
-                        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+                        assert!(
+                            hash.strip_prefix("c_")
+                                .is_some_and(crate::core::invocation::valid_id)
+                        );
                         assert!(
                             !hash.is_empty(),
                             "keep the recall command directly runnable"
@@ -205,7 +208,7 @@ mod tests {
             database_path: Some(dir.path().join("recall.db")),
             ..RetrieverConfig::default()
         };
-        let raw = "x".repeat(60);
+        let raw = "x".repeat(90);
         let hint = store_hint(&cfg, &raw, "budget", None).expect("recovery hint");
         let original_hint = hint.split_once(']').expect("bracketed hint").0.to_owned() + "]";
         let before = crate::core::runner::emit_guarded("short", Some(&original_hint), &raw);

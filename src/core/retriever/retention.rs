@@ -1,6 +1,6 @@
 //! Retention policy and explicit maintenance for the configured recall store.
 
-use super::{RetrieverConfig, db_path, init_schema, now_secs};
+use super::{RetrieverConfig, db_path, init_schema, now_secs, prune_captures};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use std::collections::HashSet;
@@ -142,6 +142,7 @@ pub(super) fn maintain_store(cfg: &RetrieverConfig, purge: bool) -> Result<usize
     } else {
         evict(&tx, cfg, &[])?;
     }
+    prune_captures(&tx)?;
     let removed = before - totals(&tx)?.0;
     tx.commit().context("apply recall retention")?;
 

@@ -105,10 +105,14 @@ When a command fails — or a filter trims a long list — RTK persists the full
 
 ```
 FAILED: 2/15 tests
-[full output: rtk recall 36365b69eda6] (unfiltered; may contain sensitive data)
+[full output: rtk recall c_7d16363b493245f9857c323349f42ba0] (unfiltered; may contain sensitive data)
 ```
 
-Your AI assistant runs `rtk recall <hash>` exactly as printed in the hint — that is the whole agent interface. For humans inspecting the store: `rtk recall <hash> --full | --from N | --lines N | --grep PAT` and `rtk recall --list`. Storage is byte-faithful (`BLOB` + lossless gzip); the stored input is the captured command text, as with the previous tee files.
+Your AI assistant runs `rtk recall <reference>` exactly as printed in the hint — that is the whole agent interface. For humans inspecting the store: `rtk recall <reference> --full | --from N | --lines N | --grep PAT` and `rtk recall --list`. Storage is byte-faithful (`BLOB` + lossless gzip); the stored input is the captured command text, as with the previous tee files.
+
+New hints identify one immutable capture: repeating the same command output cannot change an earlier hint’s saved bytes, starting line, working directory, exit status or truncation metadata. Identical retained payloads are deduplicated. Use the complete `c_...` reference; capture prefixes are not accepted. Existing legacy hashes and their unique prefixes remain readable.
+
+References expire when their payload is evicted or their capture record ages out of the bounded 1,000-record history. Expired references fail rather than pointing at a later run, even if that run saves identical bytes. Caps apply when capturing: `--full` returns all bytes saved for that capture, which may be less than the original command output.
 
 Both SQLite recall and legacy tee files keep the payload supplied by a filter without secret redaction. This may be raw captured output or reconstructed recovery text. A summary that omits a sensitive field does not remove it from stored recovery output. Review recovered content before copying it into a transcript or bug report. The same notice follows full-output and hidden-tail hints; the command or shell-quoted path inside the brackets remains unchanged.
 
@@ -120,7 +124,7 @@ The simplest way is the CLI — no file editing needed:
 
 ```bash
 rtk config recall           # show the active mode and its source
-rtk config recall sqlite    # hash-addressed sqlite store (default)
+rtk config recall sqlite    # capture-addressed sqlite store (default)
 rtk config recall tee       # legacy .log files in ~/.local/share/rtk/tee/
 rtk config recall disabled  # no recovery storage
 ```

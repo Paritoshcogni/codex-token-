@@ -514,7 +514,7 @@ When a command fails, RTK saves the full unfiltered output so the LLM can recall
 
 ```
 FAILED: 2/15 tests
-[full output: rtk recall 3f9c2a81d4e7] (unfiltered; may contain sensitive data)
+[full output: rtk recall c_7d16363b493245f9857c323349f42ba0] (unfiltered; may contain sensitive data)
 ```
 
 The SQLite store keeps up to 200 outputs with a 10 MiB uncompressed per-entry
