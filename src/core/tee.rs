@@ -21,7 +21,7 @@ fn store_hint(
     exit_code: Option<i32>,
 ) -> Option<String> {
     match retriever::store(cfg, content.as_bytes(), slug, exit_code, 1) {
-        Stored::Saved(s) => Some(format!("[full output: rtk recall {}]", s.hash)),
+        Stored::Saved(s) => Some(format!("[full output: rtk recall {}]", s.reference)),
         Stored::Unavailable | Stored::Empty => None,
     }
 }
@@ -98,7 +98,7 @@ pub fn force_tee_tail_hint(
             match retriever::store(&cfg, content.as_bytes(), command_slug, None, line_offset) {
                 Stored::Saved(s) if s.hidden_lines > 0 => Some(format!(
                     "[+{} hidden: rtk recall {}]",
-                    s.hidden_lines, s.hash
+                    s.hidden_lines, s.reference
                 )),
                 Stored::Saved(_) | Stored::Unavailable | Stored::Empty => None,
             }

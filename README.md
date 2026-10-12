@@ -514,7 +514,7 @@ When a command fails, RTK saves the full unfiltered output so the LLM can recall
 
 ```
 FAILED: 2/15 tests
-[full output: rtk recall 3f9c2a81d4e7]
+[full output: rtk recall c_7d16363b493245f9857c323349f42ba0]
 ```
 
 Legacy `[tee]` config sections are still honored: they map to `mode = "tee"` (file-based recovery on failure/truncation), or `mode = "disabled"` if you had `enabled = false`. The former `mode = "always"` keeps its behaviour and maps to `tee_on_success = true`, which archives successful runs too. The sqlite store stays failure/truncation-driven.
