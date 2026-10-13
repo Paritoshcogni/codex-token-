@@ -985,8 +985,9 @@ enum Commands {
     /// auto-allows on 0 runs rtk with that variable unset.
     ///
     /// 1 - nothing printed, no rewrite (no RTK equivalent, nothing left to
-    /// rewrite, a command excluded in config, or a construct RTK does not
-    /// rewrite such as `$(...)` or a file redirect): run the command unchanged.
+    /// rewrite, a command excluded in config, a construct RTK does not
+    /// rewrite such as `$(...)` or a file redirect, or a deny rule matched
+    /// inside a shell wrapper's script): run the command unchanged.
     ///
     /// 2 - nothing printed, a deny rule matched (checked before anything
     /// else): defer to the agent's own deny.
