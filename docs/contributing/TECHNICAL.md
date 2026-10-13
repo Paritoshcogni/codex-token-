@@ -216,6 +216,7 @@ LLM Agent executes rewritten command
 Key design decisions:
 - **Lexer-based tokenization**: A single-pass state machine (`lexer.rs`) handles all shell constructs (quotes, escapes, redirects, operators). Used for both compound splitting and redirect stripping.
 - **Segment-level rewriting**: Compound commands are split by operators, each segment rewritten independently. Bash recombines them at execution time.
+- **Conservative shell-wrapper recursion**: Only exact quoted `sh|bash|zsh|fish -c` wrappers enter one level of inner rewriting. The parser hands back byte ranges instead of a decoded script, so the wrapper's own bytes are never re-quoted, and it reports the shell it matched so the script is attested under that shell's grammar rather than under bash's.
 - **Pipe semantics**: Producers and intermediate stages of `|` remain raw. Only an argument-safe final stage whose rule has `pipeline_final_safe` may be rewritten; initially this is limited to ordinary `grep` and `rg` invocations. Search pattern-file forms (`-f`/`--file`) defer because they can consume pipeline stdin as configuration. `|&` is recognized separately and its complete pipeline stays raw.
 - **Double env prefix handling**: `classify_command()` strips env prefixes to match the underlying command against rules. `rewrite_segment()` extracts the same prefix separately to re-prepend it to the rewritten command.
 - **Fallback contract**: If any segment fails to match, it stays raw. `rewrite_command()` returns `None` only when zero segments were rewritten.
@@ -327,7 +328,7 @@ Start here, then drill down into each README for file-level details.
 | [`cline/`](../../hooks/cline/README.md) | Cline / Roo Code | Rules file (prompt-level, no programmatic hook) |
 | [`windsurf/`](../../hooks/windsurf/README.md) | Windsurf / Cascade | Rules file (workspace-scoped) |
 | [`codex/`](../../hooks/codex/README.md) | OpenAI Codex CLI | Native `PreToolUse` processor, hooks.json registration, AGENTS.md awareness |
-| [`opencode/`](../../hooks/opencode/README.md) | OpenCode | TypeScript plugin, zx library, in-place mutation |
+| [`opencode/`](../../hooks/opencode/README.md) | OpenCode | TypeScript plugin, in-place mutation (OpenCode 2.0 and 1.x >= 1.18.29) |
 
 ---
 
@@ -345,7 +346,7 @@ RTK supports the following LLM agents through hook integrations:
 | Cline/Roo Code | Rules file | Prompt-level guidance | N/A (prompt) |
 | Windsurf | Rules file | Prompt-level guidance | N/A (prompt) |
 | Codex CLI | Rust binary | `rtk hook codex` reads JSON | Yes (`updatedInput`) |
-| OpenCode | TS plugin | `tool.execute.before` event | Yes (in-place mutation) |
+| OpenCode | TS plugin | execute.before (v2) / tool.execute.before (v1) | Yes (in-place mutation) |
 
 > **Details**: [`hooks/README.md`](../../hooks/README.md) has the full JSON schemas for each agent. [`src/hooks/README.md`](../../src/hooks/README.md) covers installation, integrity verification, and the rewrite command.
 

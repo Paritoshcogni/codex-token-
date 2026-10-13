@@ -1284,14 +1284,21 @@ rtk init -g --uninstall         # Desinstaller
 | `~/.claude/RTK.md` | Instructions minimales pour le LLM |
 | `~/.claude/settings.json` | Enregistrement du hook PreToolUse |
 
-### `rtk rewrite` -- Recriture de commande
+### `rtk rewrite` -- Reecriture de commande
 
-Commande interne utilisee par le hook. Imprime la commande reecrite sur stdout (exit 0) ou sort avec exit 1 si aucun equivalent RTK n'existe.
+Commande interne utilisee par le hook. Le code de sortie porte la decision de permission, prise d'apres les regles de permission de Claude Code appliquees a chaque commande d'une chaine :
+
+- `0` : imprime la commande reecrite, des regles allow couvrent chaque commande ; le hook peut l'autoriser sans demander
+- `1` : sans sortie, pas de reecriture (aucun equivalent RTK, rien a reecrire, commande exclue dans la config, ou construction que RTK ne reecrit pas, comme `$(...)` ou une redirection de fichier) ; la commande passe inchangee
+- `2` : sans sortie, une regle deny correspond (verifie avant tout le reste) ; le hook s'en remet au refus de l'agent
+- `3` : imprime la commande reecrite, une regle ask correspond ou les regles allow ne couvrent pas chaque commande, y compris sans aucune regle ; l'agent demande confirmation
+
+Une integration lit donc stdout pour les codes `0` et `3`, et garde la demande de confirmation pour le code `3`. Avec `RTK_REWRITE_HOST=openclaw`, une integration qui gere elle-meme l'approbation recoit `0` a la place de tout `3` qui ne vient pas d'une regle ask ; une integration qui autorise sans demander sur `0` lance donc `rtk rewrite` sans cette variable.
 
 ```bash
-rtk rewrite "git status"           # -> "rtk git status" (exit 0)
-rtk rewrite "terraform plan"       # -> (exit 1, pas de recriture)
-rtk rewrite "rtk git status"       # -> "rtk git status" (exit 0, inchange)
+rtk rewrite "git status"           # -> "rtk git status" (exit 3 sans regle)
+rtk rewrite "echo hello"           # -> (exit 1, pas de reecriture)
+rtk rewrite "rtk git status"       # -> "rtk git status" (exit 3 sans regle, inchange)
 ```
 
 ### `rtk verify` -- Verification d'integrite

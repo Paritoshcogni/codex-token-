@@ -35,7 +35,7 @@ Agent runs "cargo test"
 | GitHub Copilot CLI | Shell hook (`PreToolUse`) | Yes |
 | Cursor | Shell hook (`preToolUse`) | Yes |
 | Gemini CLI | Rust binary (`BeforeTool`) | Yes |
-| OpenCode | TypeScript plugin (`tool.execute.before`) | Yes |
+| OpenCode | TypeScript plugin (`execute.before` in 2.0, `tool.execute.before` in 1.x >= 1.18.29) | Yes |
 | OpenClaw | TypeScript plugin (`before_tool_call`) | Yes |
 | Pi | TypeScript extension (`tool_call` event) | Yes |
 | Oh My Pi (OMP) | TypeScript extension (`tool_call` event, shared with Pi) | Yes |
@@ -135,8 +135,7 @@ rtk init --global --gemini
 rtk init --global --opencode
 ```
 
-Installs the Claude Code setup and creates `~/.config/opencode/plugins/rtk.ts`.
-The plugin uses the `tool.execute.before` hook.
+Installs the Claude Code setup and creates `~/.config/opencode/plugins/rtk.ts`. The plugin registers both OpenCode 2.0 (`execute.before`) and OpenCode 1.x (`tool.execute.before`) hooks, in one default export carrying both entrypoints. That shape is supported from OpenCode 1.18.29, the floor OpenCode documents for it; with an older OpenCode, when it can read `opencode --version`, `rtk init` writes nothing and says so.
 
 ### Pi
 
