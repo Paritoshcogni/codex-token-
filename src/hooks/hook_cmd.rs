@@ -1204,7 +1204,16 @@ pub fn run_opencode(cmd: &str, agent: Option<&str>) -> Result<()> {
 
 /// [`opencode_answer`] against the rules OpenCode resolves for `agent`.
 fn opencode_answer_for(cmd: &str, agent: Option<&str>) -> Value {
-    let rules = permissions_opencode::load_opencode_rules(agent);
+    // Two rule sources rtk cannot judge, and a rewrite judged without them
+    // would silence an ask: an agent markdown file whose frontmatter declares
+    // permission rules, and a legacy key only one OpenCode generation applies.
+    // Answer `{}` and let OpenCode apply its own rules.
+    if permissions_opencode::agent_rules_unreadable(agent) {
+        return json!({});
+    }
+    let Some(rules) = permissions_opencode::load_judgeable_opencode_rules(agent) else {
+        return json!({});
+    };
     opencode_answer(cmd, &rules)
 }
 
@@ -2726,6 +2735,61 @@ mod tests {
                     super::super::opencode_answer_for("git status", None),
                     json!({ "command": "rtk git status" }),
                     "without the agent, no rule applies and the rewrite stands"
+                );
+            });
+        }
+
+        #[test]
+        fn a_legacy_key_only_2x_applies_stops_the_rewrite() {
+            use crate::core::test_isolation;
+
+            // 1.x ignores `shell`, 2.x applies it: judged as an allow, the
+            // rewrite would silence the `ls *` ask on 1.x.
+            let tmp = test_isolation::tempdir();
+            let project = tmp.path().join("project");
+            std::fs::create_dir_all(&project).expect("create project");
+            std::fs::write(
+                project.join("opencode.json"),
+                r#"{ "permission": { "bash": { "ls *": "ask" }, "shell": "allow" } }"#,
+            )
+            .expect("write config");
+
+            test_isolation::with_root(&tmp.path().join("home"), || {
+                let _entered = test_isolation::enter(&project);
+                assert_eq!(super::super::opencode_answer_for("ls -la", None), json!({}));
+            });
+        }
+
+        #[test]
+        fn a_markdown_agents_rules_stop_the_rewrite_entirely() {
+            use crate::core::test_isolation;
+
+            let tmp = test_isolation::tempdir();
+            let project = tmp.path().join("project");
+            let agents = project.join(".opencode").join("agents");
+            std::fs::create_dir_all(&agents).expect("create agents dir");
+            std::fs::write(
+                agents.join("rtkprobe.md"),
+                "---\ndescription: probes\npermissions:\n  - action: shell\n    resource: ls *\n    effect: ask\n---\nbody\n",
+            )
+            .expect("write agent file");
+            std::fs::write(
+                project.join(".opencode").join("agents").join("plainer.md"),
+                "---\ndescription: no rules here\nmodel: anthropic/claude\n---\nbody\n",
+            )
+            .expect("write plainer agent file");
+
+            test_isolation::with_root(&tmp.path().join("home"), || {
+                let _entered = test_isolation::enter(&project);
+                assert_eq!(
+                    super::super::opencode_answer_for("ls -la", Some("rtkprobe")),
+                    json!({}),
+                    "rules rtk cannot read means no rewrite at all"
+                );
+                assert_eq!(
+                    super::super::opencode_answer_for("ls -la", Some("plainer")),
+                    json!({ "command": "rtk ls -la" }),
+                    "an agent file with no rules key keeps the rewrite"
                 );
             });
         }
