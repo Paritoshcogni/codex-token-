@@ -12,6 +12,7 @@ pub mod constants;
 pub mod display_helpers;
 pub mod filter;
 pub mod guard;
+pub mod operand_glob;
 #[cfg(feature = "engine")]
 pub mod pipeline_cmd;
 #[cfg(feature = "engine")]
