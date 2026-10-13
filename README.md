@@ -394,6 +394,28 @@ The most effective way to use rtk. The hook transparently intercepts Bash comman
 
 **Scope note:** this only applies to Bash tool calls. Claude Code built-in tools such as `Read`, `Grep`, and `Glob` bypass the hook, so use shell commands or explicit `rtk` commands when you want RTK filtering there.
 
+Simple quoted shell wrappers are also rewritten without changing the selected
+shell:
+
+```bash
+bash -c "head foo && grep -R bar ."
+# → bash -c "rtk read foo --head-lines 10 && rtk grep -R bar ."
+```
+
+This support is intentionally conservative: it covers exact `sh -c`,
+`bash -c`, `zsh -c` and `fish -c` wrappers with a quoted portable script.
+Because the wrapper names the shell, a `fish -c` script is read as fish: its
+own syntax — `(cmd)` substitution, `and`/`or`/`end` control flow — defers
+instead of being rewritten under POSIX assumptions:
+
+```bash
+fish -c 'git status; cargo test'      # → fish -c 'rtk git status; rtk cargo test'
+fish -c 'git status; and cargo test'  # unchanged
+```
+
+Shell expansion in an outer double quote, additional shell options, redirects
+to files, and nested wrappers pass through unchanged.
+
 ### Setup
 
 ```bash
@@ -460,7 +482,7 @@ RTK supports 18 AI coding tools. Each integration rewrites shell commands to `rt
 | **Codex** | `rtk init -g --codex` | PreToolUse hook (`updatedInput`) + AGENTS.md |
 | **Windsurf** | `rtk init -g --agent windsurf` | .windsurfrules (project-scoped) |
 | **Cline / Roo Code** | `rtk init --agent cline` | .clinerules (project-scoped) |
-| **OpenCode** | `rtk init -g --opencode` | Plugin TS (tool.execute.before) |
+| **OpenCode** | `rtk init -g --opencode` | Plugin TS (execute.before / tool.execute.before), needs 1.18.29 or newer |
 | **OpenClaw** | `openclaw plugins install ./openclaw` | Plugin TS (before_tool_call) |
 | **Pi** | `rtk init -g --agent pi` (global) | TypeScript extension (tool_call) |
 | **Oh My Pi (OMP)** | `rtk init -g --agent omp` (global) / `rtk init --agent omp` (project) | TypeScript extension (tool_call, shared with Pi) |

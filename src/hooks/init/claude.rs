@@ -55,8 +55,8 @@ fn run_claude_md_mode_with(
     // Runs before the Unchanged return so that re-running restores a deleted plugin.
     if global && install_opencode {
         let opencode_plugin_path = prepare_opencode_plugin_path()?;
-        ensure_opencode_plugin_installed(&opencode_plugin_path, ctx)?;
-        if !dry_run {
+        let installed = ensure_opencode_plugin_installed(&opencode_plugin_path, ctx)?;
+        if !dry_run && installed {
             println!(
                 "[ok] OpenCode plugin installed: {}",
                 opencode_plugin_path.display()
@@ -341,8 +341,7 @@ pub(super) fn run_default_mode(
 
     let opencode_plugin_path = if install_opencode {
         let path = prepare_opencode_plugin_path()?;
-        ensure_opencode_plugin_installed(&path, ctx)?;
-        Some(path)
+        ensure_opencode_plugin_installed(&path, ctx)?.then_some(path)
     } else {
         None
     };
@@ -374,8 +373,12 @@ pub(super) fn run_default_mode(
     }
 
     // 5. Patch settings.json with binary command
-    let patch_result =
-        patch_settings_json_command(CLAUDE_HOOK_COMMAND, patch_mode, install_opencode, ctx)?;
+    let patch_result = patch_settings_json_command(
+        CLAUDE_HOOK_COMMAND,
+        patch_mode,
+        opencode_plugin_path.is_some(),
+        ctx,
+    )?;
 
     // Report result
     if !dry_run {
@@ -385,7 +388,7 @@ pub(super) fn run_default_mode(
             }
             PatchResult::AlreadyPresent => {
                 println!("\n  settings.json: hook already present");
-                if install_opencode {
+                if opencode_plugin_path.is_some() {
                     println!("  Restart Claude Code and OpenCode. Test with: git status");
                 } else {
                     println!("  Restart Claude Code. Test with: git status");
@@ -556,8 +559,7 @@ pub(super) fn run_hook_only_mode(
 
     let opencode_plugin_path = if install_opencode {
         let path = prepare_opencode_plugin_path()?;
-        ensure_opencode_plugin_installed(&path, ctx)?;
-        Some(path)
+        ensure_opencode_plugin_installed(&path, ctx)?.then_some(path)
     } else {
         None
     };
@@ -574,8 +576,12 @@ pub(super) fn run_hook_only_mode(
     }
 
     // Patch settings.json with binary command
-    let patch_result =
-        patch_settings_json_command(CLAUDE_HOOK_COMMAND, patch_mode, install_opencode, ctx)?;
+    let patch_result = patch_settings_json_command(
+        CLAUDE_HOOK_COMMAND,
+        patch_mode,
+        opencode_plugin_path.is_some(),
+        ctx,
+    )?;
 
     // Report result
     if !dry_run {
@@ -585,7 +591,7 @@ pub(super) fn run_hook_only_mode(
             }
             PatchResult::AlreadyPresent => {
                 println!("\n  settings.json: hook already present");
-                if install_opencode {
+                if opencode_plugin_path.is_some() {
                     println!("  Restart Claude Code and OpenCode. Test with: git status");
                 } else {
                     println!("  Restart Claude Code. Test with: git status");
