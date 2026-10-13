@@ -431,7 +431,7 @@ fn call_text<'a>(code: &'a str, head: regex::Match<'_>) -> (&'a str, &'a str) {
 
 /// The environment reads that stay direct, as written, each with its reason.
 /// Each covers one read: a second identical call in the same file is refused.
-const DIRECT_READS: [(&str, &str); 4] = [
+const DIRECT_READS: [(&str, &str); 8] = [
     // Builds the `PATH` a Windows test hands a child, extending the one it runs
     // under so the child still finds its tools.
     ("src/core/utils.rs", r#"var_os("PATH")"#),
@@ -444,6 +444,12 @@ const DIRECT_READS: [(&str, &str); 4] = [
     // Reads the developer's values of the variables a child keeps, and finds
     // the `GIT_` ones a git child would inherit, to clear them.
     ("src/core/test_isolation/scratch.rs", "vars_os()"),
+    // Credential variables a pipeline names at run time, so no accessor
+    // could resolve or redirect them for a child.
+    ("src/core/classify.rs", "var(env)"),
+    ("src/core/pipeline_cmd.rs", "var(&env)"),
+    ("src/core/task_cmd.rs", "var(var)"),
+    ("src/llm_proxy.rs", "var(agent.base_url_var)"),
 ];
 
 /// The environment variable an accessor call names: a literal names itself, a
