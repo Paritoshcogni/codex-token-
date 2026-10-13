@@ -634,6 +634,8 @@ fn run_show(
     // with RTK's own flags -- the stat step strips the patch-shape flags, so it succeeds where
     // git refused (`git show -pq HEAD` exits 128 raw) and the compaction looked like success.
     if !raw_result.success() {
+        // git prints some failures (a usage page) on stdout, so forward it as well
+        print!("{}", raw_result.stdout);
         if !raw_result.stderr.trim().is_empty() {
             eprint!("{}", raw_result.stderr);
         }
@@ -1762,6 +1764,8 @@ fn run_log(
     let result = exec_capture(&mut cmd).context("Failed to run git log")?;
 
     if !result.success() {
+        // git prints some failures (a usage page) on stdout, so forward it as well
+        print!("{}", result.stdout);
         eprintln!("{}", result.stderr);
         return Ok(result.exit_code);
     }
@@ -3135,6 +3139,8 @@ fn run_fetch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32
     let raw = result.combined();
 
     if !result.success() {
+        // git prints some failures (a usage page) on stdout, so forward it as well
+        print!("{}", result.stdout);
         eprintln!("FAILED: git fetch");
         if !result.stderr.trim().is_empty() {
             eprintln!("{}", result.stderr);
