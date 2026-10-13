@@ -5,6 +5,7 @@ pub mod provider;
 pub mod registry;
 mod report;
 pub mod rules;
+pub(crate) mod shell_wrapper;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -163,11 +164,12 @@ fn estimate_hook_coverage(permission_cmd: &str, rewrite_cmd: &str, ctx: &Coverag
     if !ctx.hook_installed {
         return false;
     }
-    let verdict = permissions::check_command_with_rules(
+    let verdict = permissions::check_command_with_rules_and_prefixes(
         permission_cmd,
         &ctx.rules.deny,
         &ctx.rules.ask,
         &ctx.rules.allow,
+        &ctx.normalized_transparent_prefixes,
     );
     estimate_hook_coverage_with_verdict(permission_cmd, rewrite_cmd, verdict, ctx)
 }
@@ -185,7 +187,7 @@ fn estimate_hook_coverage_with_verdict(
     ctx: &CoverageContext,
 ) -> bool {
     ctx.hook_installed
-        && verdict != PermissionVerdict::Deny
+        && !matches!(verdict, PermissionVerdict::Deny | PermissionVerdict::Defer)
         && !lexer::contains_unattestable_construct(permission_cmd)
         && registry::rewrite_command_precompiled(
             rewrite_cmd,
@@ -726,6 +728,22 @@ mod tests {
             "grep -n foo bar.py",
             PermissionVerdict::Default,
             &test_ctx(false),
+        ));
+    }
+
+    #[test]
+    fn test_estimate_hook_coverage_false_for_deferred_wrapper() {
+        assert!(!estimate_hook_coverage_with_verdict(
+            "env bash -c 'git push'",
+            "env bash -c 'git push'",
+            PermissionVerdict::Defer,
+            &test_ctx(true),
+        ));
+        assert!(estimate_hook_coverage_with_verdict(
+            "env bash -c 'git push'",
+            "env bash -c 'git push'",
+            PermissionVerdict::Ask,
+            &test_ctx(true),
         ));
     }
 
