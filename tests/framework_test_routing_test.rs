@@ -140,11 +140,12 @@ fn missing_framework_uses_the_projects_package_manager_without_fetching() {
 fn explicit_vitest_reporter_reaches_the_spawn_and_bypasses_parsing() {
     let verbose =
         " ✓ src/a.test.ts > keeps this test name\n\n Tests  2 passed (2)\n Duration  10ms\n";
-    for (reporter, raw) in [
-        (vec!["--reporter=verbose"], verbose),
-        (vec!["--reporter", "verbose"], verbose),
+    let json_line = format!("{PASS_JSON}\n");
+    for (reporter, raw, expected_stdout) in [
+        (vec!["--reporter=verbose"], verbose, verbose),
+        (vec!["--reporter", "verbose"], verbose, verbose),
         // An explicitly requested JSON report must also remain JSON.
-        (vec!["--reporter=json"], PASS_JSON),
+        (vec!["--reporter=json"], PASS_JSON, json_line.as_str()),
     ] {
         let fixture = Fixture::new(true, None);
         let mut args = vec!["vitest", "src/a.test.ts"];
@@ -154,8 +155,8 @@ fn explicit_vitest_reporter_reaches_the_spawn_and_bypasses_parsing() {
         expected.extend(&reporter);
         fixture.assert_invocation(&expected);
         assert_eq!(out.status.code(), Some(0));
-        // The existing emitter appends a newline to the unparsed report.
-        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{raw}\n"));
+        // Terminated reports stay byte-exact; only a missing final newline is added.
+        assert_eq!(out.stdout, expected_stdout.as_bytes());
         assert!(out.stderr.is_empty());
     }
 }
@@ -185,10 +186,7 @@ fn explicit_reporter_keeps_stderr_diagnostics_and_failure_status() {
     let out = fixture.run(&["vitest", "--reporter=verbose"], stdout, stderr, 3);
     fixture.assert_invocation(&["vitest", "run", "--reporter=verbose"]);
     assert_eq!(out.status.code(), Some(3));
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        format!("{stdout}{stderr}\n")
-    );
+    assert_eq!(out.stdout, format!("{stdout}{stderr}").as_bytes());
     assert!(out.stderr.is_empty());
 }
 
@@ -226,4 +224,22 @@ fn reporter_passthrough_also_reaches_the_package_manager() {
         format!("{PASS_JSON}\n")
     );
     assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn explicit_reporter_preserves_empty_and_terminated_output() {
+    for (raw, expected) in [
+        ("", ""),
+        ("report", "report\n"),
+        ("report\n", "report\n"),
+        ("report\n\n", "report\n\n"),
+        ("report\r\n", "report\r\n"),
+    ] {
+        let fixture = Fixture::new(true, None);
+        let out = fixture.run(&["vitest", "--reporter=verbose"], raw, "", 0);
+        fixture.assert_invocation(&["vitest", "run", "--reporter=verbose"]);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(out.stdout, expected.as_bytes(), "report input: {raw:?}");
+        assert!(out.stderr.is_empty());
+    }
 }
