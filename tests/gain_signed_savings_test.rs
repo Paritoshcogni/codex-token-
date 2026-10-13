@@ -166,7 +166,13 @@ fn zero_input_retains_signed_tokens_with_finite_zero_percentage() {
 #[test]
 fn negative_quota_is_reported_as_net_loss() {
     let fixture = GainFixture::new();
-    fixture.insert("rtk regression", 6_000_000, 9_000_000, "2026-10-01");
+    // Keep each invocation within the headline's input eligibility cap,
+    // while retaining the same aggregate loss and monthly quota percentage.
+    fixture.conn.execute_batch("BEGIN").unwrap();
+    for _ in 0..1000 {
+        fixture.insert("rtk regression", 6000, 9000, "2026-10-01");
+    }
+    fixture.conn.execute_batch("COMMIT").unwrap();
     let text = fixture.text(&["--quota", "--tier", "pro"]);
     assert!(text.contains("-3.0M (-50.0%)"), "{text}");
     assert!(
@@ -258,7 +264,12 @@ fn existing_unsigned_era_database_opens_without_rewriting_history() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("schema version");
-    assert_eq!(version, 1);
+    let fresh = GainFixture::new();
+    let current_version: i64 = fresh
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, current_version);
 }
 
 #[test]
