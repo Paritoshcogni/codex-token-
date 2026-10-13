@@ -39,7 +39,7 @@ const COPILOT_INSTRUCTIONS: &str = r#"<!-- rtk-instructions v2 -->
 
 ## Rule
 
-Always prefix shell commands with `rtk`:
+Prefix external programs with `rtk`:
 
 ```bash
 # Instead of:              Use:
@@ -49,6 +49,11 @@ cargo test                 rtk cargo test
 docker ps                  rtk docker ps
 kubectl get pods           rtk kubectl get pods
 ```
+
+Do not prefix shell builtins or keywords — `test`, `[`, `read`, `cd`, `echo`,
+`export`, `eval`, `source`, `printf`. Commands such as `test`, `read`, and
+`env` also have RTK subcommands with different meanings; invoke the native
+command directly when you need it.
 
 ## Meta commands (use directly)
 
@@ -323,6 +328,13 @@ mod tests {
     use tempfile::TempDir;
 
     // Copilot tests
+
+    #[test]
+    fn test_copilot_instructions_exclude_shell_builtins_from_prefix_rule() {
+        assert!(COPILOT_INSTRUCTIONS.contains("Prefix external programs with `rtk`"));
+        assert!(COPILOT_INSTRUCTIONS.contains("Do not prefix shell builtins or keywords"));
+        assert!(!COPILOT_INSTRUCTIONS.contains("Always prefix shell commands with `rtk`"));
+    }
 
     #[test]
     fn test_copilot_init_preserves_existing_instructions() {

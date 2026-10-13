@@ -180,7 +180,12 @@ pub(super) const RTK_INSTRUCTIONS: &str = r##"<!-- rtk-instructions v2 -->
 
 ## Golden Rule
 
-**Always prefix commands with `rtk`**. If RTK has a dedicated filter, it uses it. If not, it passes through unchanged. This means RTK is always safe to use.
+**Prefix external programs with `rtk`**. If RTK has a dedicated filter, it uses it. If not, it passes the program through unchanged. This is safe for programs you would run from `PATH`.
+
+Do not prefix shell builtins or keywords — `test`, `[`, `read`, `cd`, `echo`,
+`export`, `eval`, `source`, `printf`. Commands such as `test`, `read`, and
+`env` also have RTK subcommands with different meanings; invoke the native
+command directly when you need it.
 
 **Important**: Even in command chains with `&&`, use `rtk`:
 ```bash
@@ -1730,10 +1735,32 @@ mod tests {
 
     #[test]
     fn test_awareness_activation_rule_only_in_full() {
-        const ACTIVATION: &str = "Prefix every shell command with `rtk`";
+        const ACTIVATION: &str = "Prefix external programs with `rtk`";
         assert!(!RTK_AWARENESS_DEFAULT.contains(ACTIVATION));
         assert!(!RTK_AWARENESS_HIGH.contains(ACTIVATION));
         assert!(RTK_AWARENESS_FULL.contains(ACTIVATION));
+    }
+
+    #[test]
+    fn test_agent_guidance_excludes_shell_builtins_from_prefix_rule() {
+        for (name, content) in [
+            ("awareness-full", RTK_AWARENESS_FULL),
+            ("legacy", RTK_INSTRUCTIONS),
+        ] {
+            assert!(
+                content.contains("Prefix external programs with `rtk`"),
+                "{name} must scope the prefix rule to external programs"
+            );
+            assert!(
+                content.contains("Do not prefix shell builtins or keywords"),
+                "{name} must exclude shell builtins from the prefix rule"
+            );
+            assert!(
+                !content.contains("Always prefix shell commands with `rtk`")
+                    && !content.contains("Prefix every shell command with `rtk`"),
+                "{name} must not promise that every shell command is safe to prefix"
+            );
+        }
     }
 
     #[test]

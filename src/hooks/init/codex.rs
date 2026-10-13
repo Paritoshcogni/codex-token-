@@ -1374,24 +1374,6 @@ mod tests {
         assert!(!is_rtk_authored_md("my own notes about rtk\n"));
         assert!(!is_rtk_authored_md(""));
 
-        // The payloads v0.49.0 and the builds after it wrote with nothing claiming them.
-        // Should the awareness text ever be reworded, these assertions go rather than gaining
-        // a digest: every file written from then on carries the ownership line instead.
-        for payload in [
-            RTK_AWARENESS_DEFAULT,
-            RTK_AWARENESS_HIGH,
-            RTK_AWARENESS_FULL,
-        ] {
-            let remedy = "the awareness text was reworded: delete these two assertions rather \
-                          than adding a digest for the new wording -- every file written from \
-                          then on carries the ownership line, so nothing needs recognising by \
-                          content";
-            assert!(is_rtk_authored_md(payload), "{remedy}");
-            assert!(
-                is_rtk_authored_md(&payload.replace('\n', "\r\n")),
-                "{remedy}"
-            );
-        }
         // A line of spaces is not content: the claim is on the first line that is.
         assert!(is_rtk_authored_md(&format!(
             "   \n{RTK_MD_OWNED_HEADER}\n\npayload\n"
