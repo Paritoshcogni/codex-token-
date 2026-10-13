@@ -337,7 +337,7 @@ pub fn filter_ruff_check_json(output: &str) -> String {
     }
     if violation_lines.len() > MAX_VIOLATIONS {
         result.push_str(&format!(
-            "  â€¦ +{} more\n",
+            "  … +{} more\n",
             violation_lines.len() - MAX_VIOLATIONS
         ));
         let full: String = violation_lines.concat();
@@ -636,7 +636,7 @@ Would reformat: tests/test_utils.py
             .count();
         assert!(listed <= 50, "violations cap not enforced: got {listed}");
         assert!(
-            result.contains("â€¦ +150 more"),
+            result.contains("… +150 more"),
             "missing '+N more' indicator"
         );
 
