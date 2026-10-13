@@ -23,12 +23,42 @@ fn rtk_out(repo: &Path, sub: &str, args: &[&str]) -> (Vec<u8>, Option<i32>) {
     (out.stdout, out.status.code())
 }
 
+fn git_ok(repo: &Path, args: &[&str]) {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(args);
+    common::isolate_git(&mut cmd);
+    assert!(cmd.status().expect("run git").success(), "git {args:?}");
+}
+
+/// A repo whose HEAD holds one committed file `f`, so `HEAD:f` resolves to a blob.
+fn assert_usage_kept_with_commit(sub: &str, args: &[&str]) {
+    assert_usage_kept_in(sub, args, true);
+}
+
 fn assert_usage_kept(sub: &str, args: &[&str]) {
+    assert_usage_kept_in(sub, args, false);
+}
+
+fn assert_usage_kept_in(sub: &str, args: &[&str], with_commit: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut init = Command::new("git");
-    init.arg("-C").arg(dir.path()).args(["init", "-q"]);
-    common::isolate_git(&mut init);
-    assert!(init.status().expect("git init").success());
+    git_ok(dir.path(), &["init", "-q"]);
+    if with_commit {
+        std::fs::write(dir.path().join("f"), "x\n").expect("write f");
+        git_ok(dir.path(), &["add", "f"]);
+        git_ok(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "c",
+            ],
+        );
+    }
 
     let (want, want_code) = git_out(dir.path(), sub, args);
     assert_eq!(want_code, Some(129), "git {sub} {args:?} should exit 129");
@@ -63,4 +93,24 @@ fn show_m_help_prints_usage() {
 #[test]
 fn fetch_m_help_prints_usage() {
     assert_usage_kept("fetch", &["-m", "--help"]);
+}
+
+#[test]
+fn show_blob_hh_prints_usage() {
+    assert_usage_kept_with_commit("show", &["HEAD:f", "-hh"]);
+}
+
+#[test]
+fn show_blob_m_help_prints_usage() {
+    assert_usage_kept_with_commit("show", &["HEAD:f", "-m", "--help"]);
+}
+
+#[test]
+fn branch_list_h_prints_usage() {
+    assert_usage_kept("branch", &["-l", "-h"]);
+}
+
+#[test]
+fn branch_m_help_prints_usage_on_stdout() {
+    assert_usage_kept("branch", &["-m", "--help"]);
 }

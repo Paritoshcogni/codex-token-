@@ -519,6 +519,10 @@ fn run_show(
             crate::core::stream::exec_capture_bytes(&mut cmd).context("Failed to run git show")?;
         let rtk_label = format!("rtk {tracked}");
         if !result.success() {
+            // git prints some failures (a usage page) on stdout, so forward it as well, byte for
+            // byte since this route captured raw bytes
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&result.stdout);
             eprint!(
                 "{}",
                 crate::core::utils::decode_process_output(&result.stderr)
@@ -3013,9 +3017,8 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
             if !result.stderr.trim().is_empty() {
                 eprintln!("{}", result.stderr);
             }
-            if !result.stdout.trim().is_empty() {
-                eprintln!("{}", result.stdout);
-            }
+            // git's usage page (`branch -m --help`) is stdout output, so keep it on stdout
+            print!("{}", result.stdout);
             return Ok(result.exit_code);
         }
         return Ok(0);
@@ -3035,6 +3038,8 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     let result = exec_capture(&mut cmd).context("Failed to run git branch")?;
 
     if !result.success() {
+        // git prints some failures (a usage page) on stdout, so forward it as well
+        print!("{}", result.stdout);
         if !result.stderr.trim().is_empty() {
             eprint!("{}", result.stderr);
         }
