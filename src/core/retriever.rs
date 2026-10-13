@@ -473,6 +473,23 @@ fn evict(conn: &Connection, cfg: &RetrieverConfig, keep_hash: &str) {
     }
 }
 
+#[cfg(feature = "engine")]
+pub fn trim_family(cfg: &RetrieverConfig, prefix: &str, keep: usize) {
+    let _ = with_open(cfg, |conn| {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM recall WHERE rowid IN (
+                SELECT rowid FROM recall WHERE command LIKE ?1 || '%'
+                ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?2
+            )",
+            params![prefix, keep as i64],
+        )?;
+        prune_captures(&tx)?;
+        tx.commit().context("trim recall family")
+    });
+}
+
 pub fn store(
     cfg: &RetrieverConfig,
     content: &[u8],
@@ -885,6 +902,42 @@ mod tests {
         let cfg = temp_cfg(dir.path());
         reset_stats_with(&cfg).unwrap();
         assert!(!cfg.database_path.as_ref().unwrap().exists());
+    }
+
+    #[cfg(feature = "engine")]
+    #[test]
+    fn family_rotation_prunes_capture_metadata_without_resurrection() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = temp_cfg(dir.path());
+        store_inner(&cfg, b"first\noutput\n", "posthook:read", None, 1).expect("first");
+        let conn = open(&cfg).expect("db");
+        let first_capture: String = conn
+            .query_row("SELECT capture_id FROM recall_captures LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .expect("capture");
+        drop(conn);
+        store_inner(&cfg, b"second\noutput\n", "posthook:read", None, 1).expect("second");
+        store_inner(&cfg, b"failure\n", "cargo", Some(1), 1).expect("unrelated");
+        trim_family(&cfg, "posthook:", 1);
+        let conn = open(&cfg).expect("rotated db");
+        let captures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r.get(0))
+            .expect("remaining captures");
+        assert_eq!(captures, 2, "rotation prunes only evicted captures");
+        let present = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM recall_captures WHERE capture_id = ?1",
+                [&first_capture],
+                |r| r.get(0),
+            )
+            .expect("old capture count")
+        };
+        assert_eq!(present(&conn), 0);
+        drop(conn);
+        store_inner(&cfg, b"first\noutput\n", "posthook:read", None, 1).expect("recapture");
+        let conn = open(&cfg).expect("db after recapture");
+        assert_eq!(present(&conn), 0, "an expired capture must not return");
     }
 
     #[test]
