@@ -261,6 +261,12 @@ fn gain_rejects_invalid_or_ignored_command_controls() {
         "--failures",
         "--recalls",
         "--reset",
+        "--watch",
+        "--by-method",
+        "--by-rule",
+        "--by-layer",
+        "--by-pipeline",
+        "--shadow",
     ] {
         for option in [
             vec!["--sort", "count"],
@@ -276,6 +282,12 @@ fn gain_rejects_invalid_or_ignored_command_controls() {
             assert!(!fixture.run(&args).status.success(), "{args:?}");
         }
     }
+    assert!(
+        !fixture
+            .run(&["--sort", "count", "--pipeline", "test"])
+            .status
+            .success()
+    );
     assert!(
         fixture
             .run(&["--graph", "--history", "--sort", "count"])
