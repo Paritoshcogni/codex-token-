@@ -254,7 +254,7 @@ pub fn classify_command(cmd: &str) -> Classification {
 
         // Extract subcommand for savings override and status detection
         let (savings, status) = if let Some(caps) = COMPILED[idx].captures(cmd_clean) {
-            if let Some(sub) = caps.get(1) {
+            if let Some(sub) = caps.get(1).or_else(|| caps.get(2)) {
                 // Collapse internal whitespace so a two-word capture ("pm  ls")
                 // still matches its single-spaced key in the tables below.
                 let subcmd_owned = sub
@@ -3203,6 +3203,59 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10", &[]),
             Some("rtk git log -10".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_git_ls_files() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git ls-files", &[]),
+            Some("rtk git ls-files".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_git_ls_files_with_args() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git ls-files --others --exclude-standard", &[]),
+            Some("rtk git ls-files --others --exclude-standard".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_git_tag() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag", &[]),
+            Some("rtk git tag".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag -l", &[]),
+            Some("rtk git tag -l".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag --list", &[]),
+            Some("rtk git tag --list".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag -l 'v1*'", &[]),
+            Some("rtk git tag -l 'v1*'".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag --list 'v1*'", &[]),
+            Some("rtk git tag --list 'v1*'".into())
+        );
+        // Creating or deleting a tag stays unrewritten
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag v1.0.0", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag -d v1.0.0", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git tag -a v1.0.0 -m 'release'", &[]),
+            None
         );
     }
 

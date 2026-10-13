@@ -12,10 +12,12 @@ use crate::core::stream::{
 use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
 use crate::core::user_dirs;
-use crate::core::utils::{exit_code_from_status, join_with_overflow, resolved_command, strip_ansi};
+use crate::core::utils::{
+    exit_code_from_output, exit_code_from_status, join_with_overflow, resolved_command, strip_ansi,
+};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub enum GitCommand {
@@ -32,6 +34,8 @@ pub enum GitCommand {
     Fetch,
     Stash { subcommand: Option<String> },
     Worktree,
+    LsFiles,
+    Tag,
 }
 
 /// Create a git Command with global options (e.g. -C, -c, --git-dir, --work-tree)
@@ -130,6 +134,8 @@ pub fn run(
             run_stash(subcommand.as_deref(), args, verbose, global_args)
         }
         GitCommand::Worktree => run_worktree(args, verbose, global_args),
+        GitCommand::LsFiles => run_ls_files(args, verbose, global_args),
+        GitCommand::Tag => run_tag(args, verbose, global_args),
     }
 }
 
@@ -3610,6 +3616,305 @@ fn filter_worktree_list(output: &str) -> String {
     result.join("\n")
 }
 
+fn ls_files_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    match kind {
+        TokenKind::Long => match name {
+            "depth" | "format" | "exclude" | "exclude-from" | "exclude-per-directory"
+            | "with-tree" | "abbrev" => Some(ValueSpec::value()),
+            _ => None,
+        },
+        TokenKind::Short => match name {
+            "X" => Some(ValueSpec::value()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_depth_arg(args: &[String], default: usize) -> (usize, Vec<String>) {
+    let tokens = arg_tokenizer::tokenize_grammar(args, &ls_files_takes_value, Dialect::Posix);
+    let depth = arg_tokenizer::double_dash_flag_value(&tokens, Dialect::Posix, "depth")
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(default);
+
+    let mut dropped = Vec::new();
+    for token in arg_tokenizer::before_dashdash(&tokens) {
+        if token.kind == TokenKind::Long && token.text == "depth" {
+            dropped.push(token.source_index);
+            if let Some(linked_idx) = token.linked {
+                if let Some(linked_tok) = tokens.get(linked_idx) {
+                    dropped.push(linked_tok.source_index);
+                }
+            }
+        }
+    }
+
+    let remaining: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !dropped.contains(idx))
+        .map(|(_, arg)| arg.clone())
+        .collect();
+
+    (depth, remaining)
+}
+
+/// Group file paths by their first `depth` path components.
+/// Root-level files (no `/`) are collected under `.`.
+fn group_by_depth(files: &[&str], depth: usize) -> Vec<(String, usize)> {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for file in files {
+        let components: Vec<&str> = file.split('/').collect();
+        let prefix = if components.len() <= depth {
+            if components.len() == 1 {
+                ".".to_string()
+            } else {
+                format!("{}/", components.join("/"))
+            }
+        } else {
+            format!("{}/", components[..depth].join("/"))
+        };
+        *counts.entry(prefix).or_default() += 1;
+    }
+    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sorted
+}
+
+fn ls_files_is_passthrough(tokens: &[Token<'_>]) -> bool {
+    arg_tokenizer::before_dashdash(tokens).iter().any(|t| match t.kind {
+        TokenKind::Short => matches!(t.text, "z" | "v"),
+        TokenKind::Long => matches!(t.text, "format" | "debug"),
+        _ => false,
+    })
+}
+
+/// `git ls-files` → compact tree grouped by directory (depth configurable via `--depth N`).
+///
+/// Passes through unchanged when `-z`, `--format`, `-v`, or `--debug` are present
+/// (scripting / custom-format invocations where transformation would break caller).
+fn run_ls_files(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
+
+    let tokens = arg_tokenizer::tokenize_grammar(args, &ls_files_takes_value, Dialect::Posix);
+    let (depth, git_args) = parse_depth_arg(args, 1);
+
+    // Flags that mean the caller is scripting or wants raw output
+    let passthrough = ls_files_is_passthrough(&tokens);
+
+    let tracked = with_args("git ls-files", &display_args(&git_args));
+
+    if passthrough {
+        let status = git_cmd(global_args)
+            .arg("ls-files")
+            .args(&git_args)
+            .status()
+            .context("Failed to run git ls-files")?;
+        timer.track_passthrough(
+            &tracked,
+            &tracking::passthrough_label(&tracked),
+        );
+        return Ok(exit_code_from_status(&status, "git ls-files"));
+    }
+
+    let mut cmd = git_cmd(global_args);
+    cmd.arg("ls-files");
+    for arg in &git_args {
+        cmd.arg(arg);
+    }
+    let result = exec_capture(&mut cmd).context("Failed to run git ls-files")?;
+
+    if !result.success() {
+        if !result.stderr.trim().is_empty() {
+            eprint!("{}", result.stderr);
+        }
+        return Ok(result.exit_code);
+    }
+
+    let files: Vec<&str> = result.stdout.lines().filter(|l| !l.is_empty()).collect();
+    let total = files.len();
+
+    let rtk_cmd = with_args("rtk git ls-files", &display_args(&git_args));
+
+    if total == 0 {
+        let msg = "(no tracked files)";
+        println!("{}", msg);
+        timer.track(
+            &tracked,
+            &rtk_cmd,
+            &result.stdout,
+            msg,
+        );
+        return Ok(0);
+    }
+
+    let grouped = group_by_depth(&files, depth);
+    let mut output_lines: Vec<String> = grouped
+        .iter()
+        .map(|(prefix, count)| format!("  {:<45} ({} files)", prefix, count))
+        .collect();
+    output_lines.push(format!("\n[total: {} tracked files — depth={}]", total, depth));
+    let output = output_lines.join("\n");
+
+    if verbose > 0 {
+        eprintln!("git ls-files: {} files, grouped at depth {}", total, depth);
+    }
+    println!("{}", output);
+    timer.track(
+        &tracked,
+        &rtk_cmd,
+        &result.stdout,
+        &output,
+    );
+    Ok(0)
+}
+
+fn tag_takes_value(kind: TokenKind, name: &str) -> Option<ValueSpec> {
+    match kind {
+        TokenKind::Long => match name {
+            "format" | "sort" | "message" | "file" | "local-user" | "contains"
+            | "no-contains" | "points-at" | "merged" | "no-merged" => Some(ValueSpec::value()),
+            _ => None,
+        },
+        TokenKind::Short => match name {
+            "m" | "F" | "u" => Some(ValueSpec::value()),
+            "n" => Some(ValueSpec::attached_only()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `git tag` → compact listing with dates and annotated-tag messages.
+/// Non-listing operations (create, delete, verify) or custom --format passthrough.
+fn run_tag(args: &[String], _verbose: u8, global_args: &[String]) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
+
+    let tokens = arg_tokenizer::tokenize_grammar(args, &tag_takes_value, Dialect::Posix);
+
+    let has_write_flag = arg_tokenizer::before_dashdash(&tokens).iter().any(|t| match t.kind {
+        TokenKind::Short => matches!(t.text, "a" | "s" | "f" | "d" | "v" | "m" | "F" | "u"),
+        TokenKind::Long => matches!(
+            t.text,
+            "annotate" | "sign" | "force" | "delete" | "verify" | "message" | "file" | "local-user"
+        ),
+        _ => false,
+    });
+
+    let has_list_flag = arg_tokenizer::before_dashdash(&tokens).iter().any(|t| match t.kind {
+        TokenKind::Short => t.text == "l",
+        TokenKind::Long => t.text == "list",
+        _ => false,
+    });
+
+    let has_free_positional = arg_tokenizer::before_dashdash(&tokens)
+        .iter()
+        .any(|t| t.is_free_positional());
+
+    // User supplied their own --format → pass through verbatim
+    let has_user_format = arg_tokenizer::before_dashdash(&tokens)
+        .iter()
+        .any(|t| t.kind == TokenKind::Long && t.text == "format");
+
+    let is_listing = !has_write_flag && (has_list_flag || !has_free_positional);
+
+    let tracked = with_args("git tag", &display_args(args));
+
+    if !is_listing || has_user_format {
+        let output = git_cmd(global_args)
+            .arg("tag")
+            .args(args)
+            .stdin(Stdio::inherit())
+            .output()
+            .context("Failed to run git tag")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = exit_code_from_output(&output, "git tag");
+        if !stdout.trim().is_empty() {
+            print!("{}", stdout);
+        }
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
+        }
+        timer.track_passthrough(
+            &tracked,
+            &tracking::passthrough_label(&tracked),
+        );
+        return Ok(exit_code);
+    }
+
+    // Listing mode: enrich with dates and annotated-tag messages.
+    // %(objecttype) == "tag"   → annotated tag object
+    // %(objecttype) == "commit" → lightweight tag pointing directly at a commit
+    let fmt = "%(refname:short)|%(creatordate:short)|%(objecttype)|%(contents:subject)";
+    let mut cmd = git_cmd(global_args);
+    cmd.args(["tag", "--format", fmt, "--sort=-version:refname"]);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let result = exec_capture(&mut cmd).context("Failed to run git tag")?;
+
+    if !result.success() {
+        if !result.stderr.trim().is_empty() {
+            eprint!("{}", result.stderr);
+        }
+        return Ok(result.exit_code);
+    }
+
+    let lines: Vec<&str> = result.stdout.lines().filter(|l| !l.is_empty()).collect();
+    let total = lines.len();
+
+    let rtk_cmd = with_args("rtk git tag", &display_args(args));
+
+    if total == 0 {
+        let msg = "(no tags)";
+        println!("{}", msg);
+        timer.track(
+            &tracked,
+            &rtk_cmd,
+            &result.stdout,
+            msg,
+        );
+        return Ok(0);
+    }
+
+    const MAX_SHOWN: usize = 20;
+    let mut output_lines: Vec<String> = Vec::new();
+    for line in lines.iter().take(MAX_SHOWN) {
+        // Format: name|date|objecttype|subject
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
+        if parts.len() == 4 {
+            let (name, date, obj_type, subject) = (parts[0], parts[1], parts[2], parts[3].trim());
+            if obj_type == "tag" && !subject.is_empty() {
+                output_lines.push(format!("  {}  {}  ({})", name, date, subject));
+            } else if obj_type == "tag" {
+                output_lines.push(format!("  {}  {}  (annotated)", name, date));
+            } else {
+                output_lines.push(format!("  {}  {}", name, date));
+            }
+        } else if !line.trim().is_empty() {
+            output_lines.push(format!("  {}", line.trim()));
+        }
+    }
+    if total > MAX_SHOWN {
+        output_lines.push(format!(
+            "  ... and {} more — use `git tag -l '<pattern>'` to filter",
+            total - MAX_SHOWN
+        ));
+    }
+
+    let output = output_lines.join("\n");
+    println!("{}", output);
+    timer.track(
+        &tracked,
+        &rtk_cmd,
+        &result.stdout,
+        &output,
+    );
+    Ok(0)
+}
+
 /// Runs an unsupported git subcommand by passing it through directly
 pub fn run_passthrough(args: &[OsString], global_args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
@@ -3635,6 +3940,129 @@ pub fn run_passthrough(args: &[OsString], global_args: &[String], verbose: u8) -
 mod tests {
     use super::*;
     use crate::core::test_isolation;
+
+    // --- ls-files helpers ---
+
+    #[test]
+    fn test_group_by_depth_1() {
+        let files = vec![
+            "services/auth/main.rs",
+            "services/auth/lib.rs",
+            "services/gateway/main.go",
+            "packages/ui/index.tsx",
+            "README.md",
+        ];
+        let grouped = group_by_depth(&files, 1);
+        let prefixes: Vec<&str> = grouped.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(prefixes.contains(&"services/"));
+        assert!(prefixes.contains(&"packages/"));
+        assert!(prefixes.contains(&"."));
+        let svc = grouped.iter().find(|(p, _)| p == "services/").unwrap();
+        assert_eq!(svc.1, 3);
+    }
+
+    #[test]
+    fn test_group_by_depth_2() {
+        let files = vec![
+            "services/auth/main.rs",
+            "services/auth/lib.rs",
+            "services/gateway/main.go",
+        ];
+        let grouped = group_by_depth(&files, 2);
+        let auth = grouped.iter().find(|(p, _)| p == "services/auth/");
+        let gw = grouped.iter().find(|(p, _)| p == "services/gateway/");
+        assert!(auth.is_some());
+        assert!(gw.is_some());
+        assert_eq!(auth.unwrap().1, 2);
+        assert_eq!(gw.unwrap().1, 1);
+    }
+
+    #[test]
+    fn test_group_by_depth_root_files() {
+        let files = vec!["README.md", "Cargo.toml"];
+        let grouped = group_by_depth(&files, 1);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0, ".");
+        assert_eq!(grouped[0].1, 2);
+    }
+
+    #[test]
+    fn test_parse_depth_arg_default() {
+        let args: Vec<String> = vec!["--others".into()];
+        let (depth, remaining) = parse_depth_arg(&args, 1);
+        assert_eq!(depth, 1);
+        assert_eq!(remaining, vec!["--others"]);
+    }
+
+    #[test]
+    fn test_parse_depth_arg_two_token() {
+        let args: Vec<String> = vec!["--depth".into(), "3".into(), "--others".into()];
+        let (depth, remaining) = parse_depth_arg(&args, 1);
+        assert_eq!(depth, 3);
+        assert_eq!(remaining, vec!["--others"]);
+    }
+
+    #[test]
+    fn test_parse_depth_arg_equals() {
+        let args: Vec<String> = vec!["--depth=2".into(), "--cached".into()];
+        let (depth, remaining) = parse_depth_arg(&args, 1);
+        assert_eq!(depth, 2);
+        assert_eq!(remaining, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_ls_files_is_passthrough() {
+        let a1 = ["-z"];
+        let t1 = arg_tokenizer::tokenize_grammar(&a1, &ls_files_takes_value, Dialect::Posix);
+        assert!(ls_files_is_passthrough(&t1));
+
+        let a2 = ["--format=%(path)"];
+        let t2 = arg_tokenizer::tokenize_grammar(&a2, &ls_files_takes_value, Dialect::Posix);
+        assert!(ls_files_is_passthrough(&t2));
+
+        let a3 = ["-v"];
+        let t3 = arg_tokenizer::tokenize_grammar(&a3, &ls_files_takes_value, Dialect::Posix);
+        assert!(ls_files_is_passthrough(&t3));
+
+        let a4 = ["--debug"];
+        let t4 = arg_tokenizer::tokenize_grammar(&a4, &ls_files_takes_value, Dialect::Posix);
+        assert!(ls_files_is_passthrough(&t4));
+
+        let a5 = ["--", "-z"];
+        let t5 = arg_tokenizer::tokenize_grammar(&a5, &ls_files_takes_value, Dialect::Posix);
+        assert!(!ls_files_is_passthrough(&t5));
+
+        let a6 = ["--cached"];
+        let t6 = arg_tokenizer::tokenize_grammar(&a6, &ls_files_takes_value, Dialect::Posix);
+        assert!(!ls_files_is_passthrough(&t6));
+    }
+
+    #[test]
+    fn test_tag_listing_detection() {
+        // Bare tag is listing
+        let t_bare = arg_tokenizer::tokenize_grammar::<String>(&[], &tag_takes_value, Dialect::Posix);
+        assert!(!arg_tokenizer::before_dashdash(&t_bare).iter().any(|t| t.is_free_positional()));
+
+        // -l is listing
+        let args_l = vec!["-l".to_string()];
+        let t_l = arg_tokenizer::tokenize_grammar(&args_l, &tag_takes_value, Dialect::Posix);
+        assert!(arg_tokenizer::before_dashdash(&t_l).iter().any(|t| t.kind == TokenKind::Short && t.text == "l"));
+
+        // --list is listing
+        let args_list = vec!["--list".to_string(), "v*".to_string()];
+        let t_list = arg_tokenizer::tokenize_grammar(&args_list, &tag_takes_value, Dialect::Posix);
+        assert!(arg_tokenizer::before_dashdash(&t_list).iter().any(|t| t.kind == TokenKind::Long && t.text == "list"));
+
+        // -d is write (delete)
+        let args_d = vec!["-d".to_string(), "v1.0".to_string()];
+        let t_d = arg_tokenizer::tokenize_grammar(&args_d, &tag_takes_value, Dialect::Posix);
+        assert!(arg_tokenizer::before_dashdash(&t_d).iter().any(|t| matches!(t.kind, TokenKind::Short) && t.text == "d"));
+
+        // positional without -l is write (create tag)
+        let args_create = vec!["v1.0".to_string()];
+        let t_create = arg_tokenizer::tokenize_grammar(&args_create, &tag_takes_value, Dialect::Posix);
+        assert!(arg_tokenizer::before_dashdash(&t_create).iter().any(|t| t.is_free_positional()));
+    }
 
     #[test]
     fn test_branch_dash_u_links_its_upstream_value_not_a_free_positional() {
