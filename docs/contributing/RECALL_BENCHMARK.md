@@ -21,7 +21,7 @@ block, rather than all 100 tails. `--files`, `--lines`, and `--runs` are adjusta
 To time the storage phases separately, run:
 
 ```sh
-cargo test --release --bin rtk test_benchmark_recall_batch_phases -- --ignored --nocapture
+cargo test --release --lib test_benchmark_recall_batch_phases -- --ignored --nocapture
 ```
 
 This opt-in test measures preparation (hashing, capture IDs, byte caps, line

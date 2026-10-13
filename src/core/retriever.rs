@@ -865,6 +865,23 @@ fn write_batch(cfg: &RetrieverConfig, entries: &[PreparedSlot<'_>]) -> Result<Ve
     })
 }
 
+#[cfg(feature = "engine")]
+pub fn trim_family(cfg: &RetrieverConfig, prefix: &str, keep: usize) {
+    let _ = with_open(cfg, |conn| {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM recall WHERE rowid IN (
+                SELECT rowid FROM recall WHERE command LIKE ?1 || '%'
+                ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?2
+            )",
+            params![prefix, keep as i64],
+        )?;
+        prune_captures(&tx)?;
+        tx.commit().context("trim recall family")
+    });
+}
+
 pub fn store(
     cfg: &RetrieverConfig,
     content: &[u8],
@@ -1189,6 +1206,28 @@ fn list_entries(conn: &Connection) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "engine")]
+    #[test]
+    fn test_posthook_family_trim_updates_payload_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            compression: false,
+            max_total_bytes: 16,
+            ..temp_cfg(dir.path())
+        };
+        let failure = store_inner(&cfg, b"err\n", "cargo test", Some(1), 1).unwrap();
+        store_inner(&cfg, b"old\n", "posthook:bash_ls", None, 1).unwrap();
+        let newest = store_inner(&cfg, b"new\n", "posthook:bash_ls", None, 1).unwrap();
+        trim_family(&cfg, "posthook:", 1);
+        let conn = open(&cfg).unwrap();
+        assert_eq!(storage_totals(&conn), (2, 8));
+        assert!(load_by_hash(&conn, &failure.hash).unwrap().is_some());
+        assert!(load_by_hash(&conn, &newest.hash).unwrap().is_some());
+        store_inner(&cfg, b"next log", "cargo build", Some(1), 1).unwrap();
+        assert_eq!(storage_totals(&conn), (3, 16));
+        assert!(load_by_hash(&conn, &failure.hash).unwrap().is_some());
+    }
 
     #[test]
     fn test_forget_rejects_an_empty_database_path() {
@@ -2085,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual timing: cargo test --release --bin rtk test_benchmark_recall_batch_phases -- --ignored --nocapture"]
+    #[ignore = "manual timing: cargo test --release --lib test_benchmark_recall_batch_phases -- --ignored --nocapture"]
     fn test_benchmark_recall_batch_phases() {
         let payloads: Vec<_> = (0..100).map(|file| (0..80)
             .map(|line| format!("corpus/file_{file:04}.txt:{line}:needle file={file:04} line={line:04} deterministic search benchmark payload\n"))
@@ -2179,6 +2218,42 @@ mod tests {
         let cfg = temp_cfg(dir.path());
         reset_stats_with(&cfg).unwrap();
         assert!(!cfg.database_path.as_ref().unwrap().exists());
+    }
+
+    #[cfg(feature = "engine")]
+    #[test]
+    fn family_rotation_prunes_capture_metadata_without_resurrection() {
+        let dir = tempfile::tempdir().expect("directory");
+        let cfg = temp_cfg(dir.path());
+        store_inner(&cfg, b"first\noutput\n", "posthook:read", None, 1).expect("first");
+        let conn = open(&cfg).expect("db");
+        let first_capture: String = conn
+            .query_row("SELECT capture_id FROM recall_captures LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .expect("capture");
+        drop(conn);
+        store_inner(&cfg, b"second\noutput\n", "posthook:read", None, 1).expect("second");
+        store_inner(&cfg, b"failure\n", "cargo", Some(1), 1).expect("unrelated");
+        trim_family(&cfg, "posthook:", 1);
+        let conn = open(&cfg).expect("rotated db");
+        let captures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recall_captures", [], |r| r.get(0))
+            .expect("remaining captures");
+        assert_eq!(captures, 2, "rotation prunes only evicted captures");
+        let present = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM recall_captures WHERE capture_id = ?1",
+                [&first_capture],
+                |r| r.get(0),
+            )
+            .expect("old capture count")
+        };
+        assert_eq!(present(&conn), 0);
+        drop(conn);
+        store_inner(&cfg, b"first\noutput\n", "posthook:read", None, 1).expect("recapture");
+        let conn = open(&cfg).expect("db after recapture");
+        assert_eq!(present(&conn), 0, "an expired capture must not return");
     }
 
     #[test]
