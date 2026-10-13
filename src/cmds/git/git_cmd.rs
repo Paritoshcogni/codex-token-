@@ -2991,6 +2991,8 @@ fn run_branch(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
             if !result.stderr.trim().is_empty() {
                 eprintln!("{}", result.stderr);
             }
+            // git prints some failures (a usage page) on stdout, so forward it as well
+            print!("{}", result.stdout);
             return Ok(result.exit_code);
         }
         return Ok(0);
@@ -3308,6 +3310,8 @@ fn run_stash(
                 if !result.stderr.trim().is_empty() {
                     eprintln!("{}", result.stderr);
                 }
+                // git prints some failures (a usage page, a conflicted pop's status) on stdout
+                print!("{}", result.stdout);
                 combined.clone()
             };
 
@@ -3350,6 +3354,8 @@ fn run_stash(
                 if !result.stderr.trim().is_empty() {
                     eprintln!("{}", result.stderr);
                 }
+                // git prints some failures (a usage page, a conflicted pop's status) on stdout
+                print!("{}", result.stdout);
                 combined.clone()
             };
 

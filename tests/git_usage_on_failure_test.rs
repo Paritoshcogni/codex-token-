@@ -114,3 +114,50 @@ fn branch_list_h_prints_usage() {
 fn branch_m_help_prints_usage_on_stdout() {
     assert_usage_kept("branch", &["-m", "--help"]);
 }
+
+#[test]
+fn branch_show_current_m_help_prints_usage() {
+    assert_usage_kept("branch", &["--show-current", "-m", "--help"]);
+}
+
+#[test]
+fn stash_push_m_help_prints_usage() {
+    assert_usage_kept("stash", &["push", "-m", "x", "--help"]);
+}
+
+#[test]
+fn stash_pop_q_h_prints_usage() {
+    assert_usage_kept("stash", &["pop", "-q", "-h"]);
+}
+
+/// A conflicted `stash pop` exits 1 and reports the conflict and the kept stash on stdout.
+#[test]
+fn stash_pop_conflict_keeps_conflict_report() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let commit = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-qam",
+        "c",
+    ];
+    git_ok(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join("f"), "a\n").expect("write f");
+    git_ok(dir.path(), &["add", "f"]);
+    git_ok(dir.path(), &commit);
+    std::fs::write(dir.path().join("f"), "b\n").expect("write f");
+    git_ok(dir.path(), &["stash", "-q"]);
+    std::fs::write(dir.path().join("f"), "c\n").expect("write f");
+    git_ok(dir.path(), &commit);
+
+    let (got, got_code) = rtk_out(dir.path(), "stash", &["pop"]);
+    assert_eq!(got_code, Some(1));
+    let got = String::from_utf8_lossy(&got);
+    assert!(
+        got.contains("CONFLICT (content): Merge conflict in f"),
+        "{got}"
+    );
+    assert!(got.contains("The stash entry is kept"), "{got}");
+}
