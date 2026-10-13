@@ -3,6 +3,7 @@
 use crate::core::arg_tokenizer::{self, Dialect, TokenKind, ValueSpec};
 use crate::core::args_utils;
 use crate::core::runner;
+use crate::core::shell::display_args;
 use crate::core::stream::{BlockHandler, BlockStreamFilter, StreamFilter};
 use crate::core::truncate::{CAP_ERRORS, CAP_LIST, CAP_WARNINGS};
 use crate::core::utils::{join_with_overflow, resolved_command, truncate};
@@ -287,7 +288,7 @@ where
     runner::run_filtered(
         cmd,
         &format!("cargo {}", subcommand),
-        &restored_args.join(" "),
+        &display_args(&restored_args),
         filter_fn,
         runner::RunOptions::with_tee(&format!("cargo_{}", subcommand)),
     )
@@ -319,7 +320,7 @@ where
     runner::run_filtered_with_exit(
         cmd,
         &format!("cargo {}", subcommand),
-        &restored_args.join(" "),
+        &display_args(&restored_args),
         filter_fn,
         runner::RunOptions::with_tee(&format!("cargo_{}", subcommand)),
     )
@@ -346,7 +347,7 @@ fn run_cargo_streamed(
     runner::run_streamed(
         cmd,
         &format!("cargo {}", subcommand),
-        &restored_args.join(" "),
+        &display_args(&restored_args),
         filter,
         runner::RunOptions::with_tee(&format!("cargo_{}", subcommand)),
     )
