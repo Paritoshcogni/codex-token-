@@ -12,11 +12,8 @@
 mod scratch;
 
 // Share the production implementation without importing the binary crate.
-#[path = "../../src/core/tracking/tokens.rs"]
-mod tokens;
-
 #[allow(unused_imports)]
-pub use tokens::estimate_tokens;
+pub use rtk_text::estimate_tokens;
 
 use std::process::Command;
 
