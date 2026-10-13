@@ -208,7 +208,17 @@ fn check_shell_wrapper_permissions(
                 }
                 continue;
             };
-            if depth == 0 {
+            // At the segment start any parsed wrapper refuses the auto-allow.
+            // Behind a transparent prefix the rewrite reaches the same wrapper
+            // — when it changes the script inside, the outer rule would
+            // auto-allow a line RTK edited without fully understanding it, so
+            // the gate reads the rewrite's own verdict on the script instead
+            // of trusting the outer match (#4545). A wrapper the rewrite
+            // leaves untouched (`bash -lc '…'`, an unrewritable script) keeps
+            // the outer verdict.
+            if depth == 0
+                || registry::wrapper_script_changed_by_rewrite(position, transparent_prefixes)
+            {
                 contains_shell_wrapper = true;
             }
             let Some(script) = wrapper.script(position) else {
@@ -1723,26 +1733,56 @@ mod tests {
     }
 
     #[test]
-    fn test_prefixed_shell_wrapper_keeps_the_outer_verdict() {
-        let allow = vec![
-            "env:*".to_string(),
-            "timeout:*".to_string(),
-            "git status:*".to_string(),
-        ];
-        for cmd in [
-            "env bash -c 'git status'",
-            "timeout 5 bash -c 'git status'",
-            "env bash -lc 'git status'",
-        ] {
+    fn test_rewritten_prefixed_wrapper_is_not_auto_allowed() {
+        // #4545 gap 1: the rewrite reaches inside the wrapper behind the
+        // transparent prefix and changes its script; the outer rule must not
+        // auto-allow a line RTK edited without fully understanding it. A
+        // wrapper whose script the rewrite leaves untouched (`-lc` does not
+        // parse, `echo` is not a rewrite target) keeps the outer verdict.
+        let allow_env = vec!["env:*".to_string(), "timeout:*".to_string()];
+        for cmd in ["env bash -c 'git status'", "timeout 5 bash -c 'git status'"] {
             assert_eq!(
-                check_command_with_rules(cmd, &[], &[], &allow),
+                check_command_with_rules(cmd, &[], &[], &allow_env),
+                PermissionVerdict::Ask,
+                "{cmd:?}"
+            );
+        }
+        for cmd in ["env bash -lc 'git status'", "env bash -c 'echo git status'"] {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &allow_env),
                 PermissionVerdict::Allow,
                 "{cmd:?}"
             );
         }
+        // At the segment start the gate already refuses to auto-allow a
+        // wrapper, rewritten or not — unchanged here.
         assert_eq!(
-            check_command_with_rules("bash -c 'git status'", &[], &[], &allow),
+            check_command_with_rules("bash -c 'git status'", &[], &[], &allow_env),
             PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn test_gate_sees_a_command_after_an_assignment_redirect() {
+        // #4545 gap 2: `FOO=a>/dev/null git push` runs `git push`, so the deny
+        // rule must reach it instead of gating on the assignment alone.
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules("FOO=a>/dev/null git push", &deny, &[], &allow),
+            PermissionVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn test_deny_reaches_a_continuation_merged_token_inside_a_script() {
+        // #4545 gap 3: bash runs `git p\<NL>ush` as `git push`; the space-join
+        // showed the gate `git p ush` and the deny never fired.
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules("env bash -c 'git p\\\nush'", &deny, &[], &allow),
+            PermissionVerdict::Defer
         );
     }
 
@@ -1827,13 +1867,17 @@ mod tests {
                 "{cmd:?}"
             );
         }
-        for cmd in ["env bash -c 'echo git push'", "env bash -c 'git -C . push'"] {
-            assert_eq!(
-                check_command_with_rules(cmd, &deny, &[], &allow),
-                PermissionVerdict::Allow,
-                "{cmd:?}"
-            );
-        }
+        // The rewrite leaves `echo git push` as-is, so the outer verdict
+        // stands; `git -C . push` it rewrites inside the wrapper, so #4545
+        // asks instead of auto-allowing on the outer rule.
+        assert_eq!(
+            check_command_with_rules("env bash -c 'echo git push'", &deny, &[], &allow),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            check_command_with_rules("env bash -c 'git -C . push'", &deny, &[], &allow),
+            PermissionVerdict::Ask
+        );
     }
 
     #[test]
@@ -1846,7 +1890,6 @@ mod tests {
             "( nice fish -lc '{ git status; }' && ls",
             "time -p sh -lc \"command git push\" ; ls",
             "env zsh -c '{ git status; }' && ls",
-            "uv run bash -c \"git status\" | grep -rn x src",
         ] {
             assert_eq!(
                 check_command_with_rules(cmd, &deny, &[], &allow),
@@ -1854,6 +1897,35 @@ mod tests {
                 "{cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_reachable_wrapper_in_a_pipeline_stage_is_asked() {
+        // The pipeline policy preserves non-final stages, so the rewrite
+        // stamps this wrapper through unchanged — but the gate's scan reaches
+        // and parses it, and the rewrite would change its script in isolation.
+        // An outer auto-allow would cover a wrapper RTK understood but did not
+        // rewrite, so it asks (#4545). A denied script inside still defers.
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules(
+                "uv run bash -c \"git status\" | grep -rn x src",
+                &[],
+                &[],
+                &allow
+            ),
+            PermissionVerdict::Ask
+        );
+        let deny = vec!["git push:*".to_string()];
+        assert_eq!(
+            check_command_with_rules(
+                "uv run bash -c \"git push\" | grep -rn x src",
+                &deny,
+                &[],
+                &allow
+            ),
+            PermissionVerdict::Defer
+        );
     }
 
     #[test]
@@ -1879,7 +1951,10 @@ mod tests {
                 &allow,
                 &prefixes
             ),
-            PermissionVerdict::Allow
+            // #4545: the user-configured transparent prefix lets the rewrite
+            // change the script inside, so the outer `*` rule must not
+            // auto-allow it — ask, same as behind a built-in prefix.
+            PermissionVerdict::Ask
         );
         assert_eq!(
             check_command_with_rules("direnv exec . bash -c 'git push'", &deny, &[], &allow),
