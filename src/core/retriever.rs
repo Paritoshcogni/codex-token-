@@ -445,6 +445,20 @@ pub fn record_tee_recall(slug: &str, path: &str) {
     record_tee_recall_with(&cfg, slug, path);
 }
 
+#[cfg(feature = "engine")]
+pub fn trim_family(cfg: &RetrieverConfig, prefix: &str, keep: usize) {
+    let _ = with_open(cfg, |conn| {
+        conn.execute(
+            "DELETE FROM recall WHERE rowid IN (
+                SELECT rowid FROM recall WHERE command LIKE ?1 || '%'
+                ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?2
+            )",
+            params![prefix, keep as i64],
+        )?;
+        Ok(())
+    });
+}
+
 pub fn store(
     cfg: &RetrieverConfig,
     content: &[u8],
@@ -849,6 +863,28 @@ mod tests {
         conn.execute("DELETE FROM recall WHERE hash = ?1", [&stored.hash])
             .unwrap();
         assert_eq!(storage_totals(&conn), (0, 0));
+    }
+
+    #[cfg(feature = "engine")]
+    #[test]
+    fn test_posthook_family_trim_updates_payload_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            compression: false,
+            max_total_bytes: 16,
+            ..temp_cfg(dir.path())
+        };
+        let failure = store_inner(&cfg, b"err\n", "cargo test", Some(1), 1).unwrap();
+        store_inner(&cfg, b"old\n", "posthook:bash_ls", None, 1).unwrap();
+        let newest = store_inner(&cfg, b"new\n", "posthook:bash_ls", None, 1).unwrap();
+        trim_family(&cfg, "posthook:", 1);
+        let conn = open(&cfg).unwrap();
+        assert_eq!(storage_totals(&conn), (2, 8));
+        assert!(load_by_hash(&conn, &failure.hash).unwrap().is_some());
+        assert!(load_by_hash(&conn, &newest.hash).unwrap().is_some());
+        store_inner(&cfg, b"next log", "cargo build", Some(1), 1).unwrap();
+        assert_eq!(storage_totals(&conn), (3, 16));
+        assert!(load_by_hash(&conn, &failure.hash).unwrap().is_some());
     }
 
     #[test]

@@ -16,6 +16,9 @@ use crate::core::user_dirs;
 use crate::core::user_env;
 use crate::core::utils::strip_leading_bom;
 
+#[cfg(feature = "engine")]
+mod claude_pipeline;
+
 const STDIN_CAP: usize = 1_048_576; // 1 MiB
 
 fn read_stdin_limited() -> Result<String> {
@@ -762,7 +765,12 @@ fn log_hook_decision(v: &Value, cmd: &str, decision: HookOutcome, rewritten: Opt
 
 /// Run the Claude Code PreToolUse hook natively.
 pub fn run_claude() -> Result<()> {
+    #[cfg(feature = "engine")]
+    let input = claude_pipeline::read_payload()?;
+    #[cfg(not(feature = "engine"))]
     let input = read_stdin_limited()?;
+    #[cfg(feature = "engine")]
+    let raw_len = input.len();
 
     let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
@@ -776,6 +784,11 @@ pub fn run_claude() -> Result<()> {
             return Ok(());
         }
     };
+
+    #[cfg(feature = "engine")]
+    if claude_pipeline::handle(&v, raw_len)? {
+        return Ok(());
+    }
 
     match process_claude_payload(&v) {
         PayloadAction::Rewrite {
