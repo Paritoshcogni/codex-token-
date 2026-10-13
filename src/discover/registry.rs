@@ -733,7 +733,7 @@ static BASH_JOIN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\\r?\n").u
 /// Replace every bash line continuation with a single space, mirroring what
 /// bash does before dispatching the command. Returns a borrowed `&str` when the
 /// input contains no continuations, so the common fast path allocates nothing.
-fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
     LINE_CONTINUATION_RE.replace_all(s, " ")
 }
 
@@ -1669,6 +1669,74 @@ fn is_excluded(cmd: &str, excluded: &[ExcludePattern]) -> bool {
     })
 }
 
+/// Every position in `seg` where [`rewrite_segment_inner`] would try a quoted
+/// shell wrapper: the segment itself and each tail reached by stripping one
+/// prefix the rewriter is transparent to, following the same branches and
+/// depth bound. The permission gate checks exactly these, so a wrapper a
+/// rewrite can reach is never auto-allowed on the outer rule, and a shell name
+/// that is merely an argument (`grep -rn bash -c src`) is never a wrapper.
+pub(crate) fn shell_wrapper_positions<'a>(
+    seg: &'a str,
+    normalized_transparent_prefixes: &[String],
+) -> Vec<&'a str> {
+    let mut positions = Vec::new();
+    collect_shell_wrapper_positions(seg, normalized_transparent_prefixes, 0, &mut positions);
+    positions
+}
+
+fn collect_shell_wrapper_positions<'a>(
+    seg: &'a str,
+    transparent_prefixes: &[String],
+    depth: usize,
+    positions: &mut Vec<&'a str>,
+) {
+    let trimmed = seg.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    positions.push(trimmed);
+    if depth >= MAX_PREFIX_DEPTH {
+        return;
+    }
+
+    let (env_prefix, rest_after_env) = strip_disabled_prefix(trimmed);
+    if !env_prefix.is_empty() {
+        if env_prefix.contains("RTK_DISABLED=") {
+            return;
+        }
+        collect_shell_wrapper_positions(rest_after_env, transparent_prefixes, depth + 1, positions);
+        return;
+    }
+
+    for (prefix, routable) in builtin_transparent_prefixes() {
+        if let Some(rest) = strip_word_prefix(trimmed, prefix) {
+            if rest.is_empty() {
+                return;
+            }
+            collect_shell_wrapper_positions(rest, transparent_prefixes, depth + 1, positions);
+            if !routable {
+                return;
+            }
+            break;
+        }
+    }
+
+    if let Some((_, rest)) = strip_process_wrapper_prefix(trimmed) {
+        collect_shell_wrapper_positions(rest, transparent_prefixes, depth + 1, positions);
+        return;
+    }
+
+    for prefix in transparent_prefixes {
+        if let Some(rest) = strip_word_prefix(trimmed, prefix) {
+            if rest.is_empty() {
+                return;
+            }
+            collect_shell_wrapper_positions(rest, transparent_prefixes, depth + 1, positions);
+            return;
+        }
+    }
+}
+
 fn rewrite_segment_inner(
     seg: &str,
     excluded: &[ExcludePattern],
@@ -2112,6 +2180,49 @@ mod tests {
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         super::rewrite_command(cmd, excluded, &[])
+    }
+
+    #[test]
+    fn test_shell_wrapper_positions_match_where_the_rewrite_reaches() {
+        let prefixes = normalize_transparent_prefixes(&["direnv exec .".to_string()]);
+        for (cmd, reached) in [
+            ("bash -c 'git status'", true),
+            ("env bash -c 'git status'", true),
+            ("FOO=1 bash -c 'git status'", true),
+            ("env FOO=1 timeout 5 bash -c 'git status'", true),
+            ("nice -n 5 bash -c 'git status'", true),
+            ("time bash -c 'git status'", true),
+            ("nohup sh -c 'git status'", true),
+            ("command bash -c 'git status'", true),
+            ("exec bash -c 'git status'", true),
+            ("uv run bash -c 'git status'", true),
+            ("direnv exec . bash -c 'git status'", true),
+            ("echo bash -c 'git status'", false),
+            ("ssh host bash -c 'git status'", false),
+            ("find . -exec bash -c 'git status' \\;", false),
+            ("sudo bash -c 'git status'", false),
+            ("RTK_DISABLED=1 bash -c 'git status'", false),
+            ("docker exec c bash -c 'git status'", false),
+        ] {
+            let rewritten = rewrite_command(cmd, &[], &prefixes)
+                .is_some_and(|rewritten| rewritten.contains("-c 'rtk git status'"));
+            let seen = shell_wrapper_positions(cmd, &prefixes)
+                .into_iter()
+                .any(|position| parse_shell_wrapper(position).is_some());
+            assert_eq!(rewritten, reached, "rewrite {cmd:?}");
+            assert_eq!(seen, reached, "positions {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn test_shell_wrapper_positions_stop_at_the_command_word() {
+        let cmd = format!("echo {}bash -c 'git status'", "a ".repeat(50_000));
+        assert_eq!(shell_wrapper_positions(&cmd, &[]), vec![cmd.as_str()]);
+        let nested = format!("{}bash -c 'git status'", "command ".repeat(15));
+        assert_eq!(
+            shell_wrapper_positions(&nested, &[]).len(),
+            MAX_PREFIX_DEPTH + 1
+        );
     }
 
     // Three compound-command segmenters look at the same kind of input for
