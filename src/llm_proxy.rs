@@ -599,7 +599,10 @@ pub fn no_data_hint() -> String {
         .map(|a| format!("`{cli} {}`", a.name))
         .collect::<Vec<_>>()
         .join(" or ");
-    format!("running on {DEFAULT_BIND} · no agent routed through it — launch one with {launchers}")
+    format!(
+        "running on {} · no agent routed through it — launch one with {launchers}",
+        daemon_bind()
+    )
 }
 
 /// An agent `rtk <agent>` can launch through the proxy.
@@ -661,9 +664,10 @@ pub fn run_agent(agent: &ProxyAgent, args: &[String]) -> Result<i32> {
         eprintln!("rtk: `{}` is not on PATH", agent.name);
         return Ok(127);
     }
-    let base_url = format!("http://{DEFAULT_BIND}");
+    let bind = daemon_bind();
+    let base_url = format!("http://{bind}");
     let existing = std::env::var(agent.base_url_var).ok();
-    let daemon_up = match ensure_running(DEFAULT_BIND) {
+    let daemon_up = match ensure_running(&bind) {
         Ok(_) => true,
         Err(e) => {
             eprintln!("rtk: proxy unavailable ({e:#})");
@@ -744,7 +748,7 @@ fn run_setup() -> Result<()> {
 }
 
 fn run_start(bind: Option<&str>, env_only: bool) -> Result<()> {
-    let bind = bind.unwrap_or(DEFAULT_BIND).to_string();
+    let bind = bind.map(str::to_string).unwrap_or_else(daemon_bind);
     let started = ensure_running(&bind)?;
 
     if env_only {
@@ -756,6 +760,9 @@ fn run_start(bind: Option<&str>, env_only: bool) -> Result<()> {
         if detect_claude_code() {
             println!();
             println!("point Claude Code at it:");
+            if let Some(export) = bind_export_hint(&bind) {
+                println!("  {export}");
+            }
             println!("  eval \"$(rtk llm-proxy start --env)\"");
             println!("  then: claude [claude args...]");
         }
@@ -763,6 +770,10 @@ fn run_start(bind: Option<&str>, env_only: bool) -> Result<()> {
         println!("already running on {bind}");
     }
     Ok(())
+}
+
+fn bind_export_hint(bind: &str) -> Option<String> {
+    (bind != daemon_bind()).then(|| format!("export RTK_PROXY_BIND={bind}"))
 }
 
 /// Where a freshly-spawned daemon writes.
@@ -1212,6 +1223,30 @@ mod tests {
 mod no_data_hint_tests {
     use super::*;
 
+    #[test]
+    fn rtk_proxy_bind_moves_the_default_bind() {
+        crate::core::user_env::with_vars(&[("RTK_PROXY_BIND", Some("127.0.0.1:8580"))], || {
+            assert_eq!(daemon_bind(), "127.0.0.1:8580");
+        });
+        crate::core::user_env::with_vars(&[("RTK_PROXY_BIND", None)], || {
+            assert_eq!(daemon_bind(), DEFAULT_BIND);
+        });
+    }
+
+    #[test]
+    fn a_one_off_bind_is_told_to_export_its_port() {
+        crate::core::user_env::with_vars(&[("RTK_PROXY_BIND", Some("127.0.0.1:8580"))], || {
+            assert_eq!(bind_export_hint("127.0.0.1:8580"), None);
+            assert_eq!(
+                bind_export_hint("127.0.0.1:9000").as_deref(),
+                Some("export RTK_PROXY_BIND=127.0.0.1:9000")
+            );
+        });
+        crate::core::user_env::with_vars(&[("RTK_PROXY_BIND", None)], || {
+            assert_eq!(bind_export_hint(DEFAULT_BIND), None);
+        });
+    }
+
     /// The daemon's reachability decides the instruction. The unreachable arm is
     /// the only one assertable without a listener; the reachable arm is covered
     /// by the shape assertions below, which hold for whichever arm runs.
@@ -1223,7 +1258,7 @@ mod no_data_hint_tests {
                 !hint.contains("llm-proxy start"),
                 "a running daemon must not be told to start: {hint}"
             );
-            assert!(hint.contains(DEFAULT_BIND), "{hint}");
+            assert!(hint.contains(&daemon_bind()), "{hint}");
             assert!(hint.contains("claude"), "{hint}");
         } else {
             assert!(hint.contains("llm-proxy start"), "{hint}");
