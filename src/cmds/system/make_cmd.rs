@@ -7,6 +7,7 @@
 //! Fallback: if input has no compiler-style lines, returns it unchanged.
 
 use crate::core::runner::{self, RunOptions};
+use crate::core::shell::display_args;
 use crate::core::utils::resolved_command;
 use anyhow::Result;
 use regex::Regex;
@@ -77,7 +78,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     runner::run_filtered(
         cmd,
         "make",
-        &args.join(" "),
+        &display_args(args),
         filter_make_output,
         RunOptions::stdout_only(),
     )
