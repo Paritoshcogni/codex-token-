@@ -34,14 +34,14 @@ pub fn ensure_proxy() -> Option<String> {
 fn ensure_proxy_impl(
     url: &str,
     probe: impl Fn(&str) -> bool,
-    spawn: impl FnOnce() -> anyhow::Result<()>,
+    spawn: impl FnOnce(&str) -> anyhow::Result<()>,
     wait: Duration,
 ) -> Option<String> {
     let addr = loopback_hostport(url)?;
     if probe(&addr) {
         return None;
     }
-    match spawn() {
+    match spawn(&addr) {
         Ok(()) => {
             let deadline = Instant::now() + wait;
             loop {
@@ -86,10 +86,10 @@ fn probe(addr: &str, timeout: Duration) -> bool {
     crate::llm_proxy::is_rtk_proxy_at(addr, timeout)
 }
 
-fn spawn_start() -> anyhow::Result<()> {
+fn spawn_start(addr: &str) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("resolve the rtk binary path")?;
     std::process::Command::new(exe)
-        .args(["llm-proxy", "start"])
+        .args(["llm-proxy", "start", "--bind", addr])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -127,7 +127,7 @@ mod tests {
         let out = ensure_proxy_impl(
             "https://api.anthropic.com",
             |_| panic!("must not probe a remote url"),
-            || panic!("must not spawn for a remote url"),
+            |_| panic!("must not spawn for a remote url"),
             Duration::ZERO,
         );
         assert_eq!(out, None);
@@ -138,7 +138,7 @@ mod tests {
         let out = ensure_proxy_impl(
             "http://127.0.0.1:8080",
             |_| true,
-            || panic!("must not spawn when the daemon answers"),
+            |_| panic!("must not spawn when the daemon answers"),
             Duration::ZERO,
         );
         assert_eq!(out, None);
@@ -153,7 +153,7 @@ mod tests {
                 calls.set(calls.get() + 1);
                 calls.get() > 1
             },
-            || Ok(()),
+            |_| Ok(()),
             Duration::from_millis(200),
         );
         let msg = out.expect("a start must be reported");
@@ -162,11 +162,26 @@ mod tests {
     }
 
     #[test]
+    fn dead_daemon_is_started_on_the_port_the_session_uses() {
+        let spawned_on = std::cell::RefCell::new(String::new());
+        ensure_proxy_impl(
+            "http://localhost:8580/v1",
+            |_| false,
+            |addr| {
+                *spawned_on.borrow_mut() = addr.to_string();
+                Ok(())
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(spawned_on.into_inner(), "127.0.0.1:8580");
+    }
+
+    #[test]
     fn slow_bind_is_reported_honestly() {
         let out = ensure_proxy_impl(
             "http://127.0.0.1:8080",
             |_| false,
-            || Ok(()),
+            |_| Ok(()),
             Duration::ZERO,
         );
         let msg = out.expect("a pending start must be reported");
@@ -178,7 +193,7 @@ mod tests {
         let out = ensure_proxy_impl(
             "http://127.0.0.1:8080",
             |_| false,
-            || anyhow::bail!("binary missing"),
+            |_| anyhow::bail!("binary missing"),
             Duration::ZERO,
         );
         let msg = out.expect("a failed start must be reported");
