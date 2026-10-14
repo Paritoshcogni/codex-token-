@@ -763,7 +763,7 @@ pub fn run(
         }
         // The CTA sits with the numbers it is about, not in a footer nobody
         // scrolls to.
-        if std::io::stdout().is_terminal() {
+        if share_cta_available() && std::io::stdout().is_terminal() {
             println!(
                 "{} {}   {}",
                 "▶ share these numbers:".green(),
@@ -1831,9 +1831,20 @@ fn watch_dispatch(watch: bool, auto_watch: bool, stdout_is_tty: bool) -> WatchDi
     }
 }
 
+pub(crate) fn share_cta_available() -> bool {
+    cfg!(feature = "engine")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_cta_only_when_pipeline_command_exists() {
+        use clap::CommandFactory;
+        let has_pipeline = crate::Cli::command().find_subcommand("pipeline").is_some();
+        assert_eq!(share_cta_available(), has_pipeline);
+    }
 
     #[cfg(feature = "engine")]
     #[test]
