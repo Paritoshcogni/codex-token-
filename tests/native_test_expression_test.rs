@@ -2,7 +2,7 @@
 //! End-to-end coverage for `Commands::Test` routing.
 //!
 //! `rtk test` doubles as a wrapper around a test runner and as the POSIX `test`
-//! utility. The unit tests in `main.rs` cover `is_native_test_expression` on its
+//! utility. The unit tests in `lib.rs` cover `is_native_test_expression` on its
 //! own; these run the binary so an inverted or removed branch in the `Commands::Test`
 //! arm fails here instead of shipping.
 
