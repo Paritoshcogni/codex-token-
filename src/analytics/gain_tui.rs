@@ -7,6 +7,7 @@
 //! Opt-in only (`--watch`), so this never touches the plain-text default
 //! view or the <10ms startup budget the rest of `rtk` is held to.
 
+use crate::analytics::gain::share_cta_available;
 use crate::core::tracking::{GainSummary as TrackerSummary, Tracker};
 use crate::core::utils::{format_signed_tokens, format_tokens};
 use crate::llm_proxy::{self, ProxyGainSummary};
@@ -87,7 +88,7 @@ fn draw(f: &mut Frame, state: &State) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(9),
-            Constraint::Length(3),
+            Constraint::Length(if share_cta_available() { 3 } else { 0 }),
             Constraint::Length(11),
             Constraint::Min(5),
             Constraint::Length(1),
@@ -96,7 +97,9 @@ fn draw(f: &mut Frame, state: &State) {
 
     draw_header(f, chunks[0], state);
     draw_kpi_panels(f, chunks[1], state);
-    draw_share_cta(f, chunks[2]);
+    if share_cta_available() {
+        draw_share_cta(f, chunks[2]);
+    }
     draw_context_panel(
         f,
         chunks[3],
