@@ -639,6 +639,25 @@ fn is_grammar_word(value: &str) -> bool {
     matches!(value, "{" | "}" | "!")
 }
 
+/// A bash assignment word: `NAME=…` or `NAME+=…` with a valid identifier
+/// name. Token text is raw — quotes and escapes preserved — so a word that
+/// merely looks like an assignment inside quotes (`"FOO=a"`, a command name)
+/// does not match, and `FOO="a b"` does.
+fn is_assignment_word(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = match bytes.first() {
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' => 1,
+        _ => return false,
+    };
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'+') {
+        i += 1;
+    }
+    i < bytes.len() && bytes[i] == b'='
+}
+
 // `>&N`/`>&-` (and `N>&M`) is fd-dup/close; bare `>&` before a word is
 // `>word 2>&1` — a file target.
 pub(crate) fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool {
@@ -673,13 +692,18 @@ pub(crate) fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool
 /// | `( ... )` grouping | splits (Shellism boundary) | does not split | does not split standalone |
 /// | trailing redirect | truncates the segment | kept | kept (rewritten output preserves it) |
 /// | leading redirect | stepped over with its attached operand, rest kept | kept | kept |
+/// | redirect on an assignment prefix | stepped over with its operand, rest kept (`FOO=a>/dev/null git push` → `git push`) | kept | kept |
 /// | lone `\r` (no following `\n`) | splits | does not split | does not split |
 ///
 /// Like [`split_on_operators`] but also breaks on newline, background `&`,
 /// subshell `( ... )`, and a lone `\r` (`NewlineMode::Conservative`), and
 /// truncates each segment at the first redirect that follows command text —
 /// deliberately conservative so a hidden command can't evade the gate by
-/// hiding behind a construct another segmenter would leave intact.
+/// hiding behind a construct another segmenter would leave intact. A redirect
+/// on an assignment prefix (`FOO=a>/dev/null`) is *not* a trailing one: bash
+/// attaches it to the assignment's null command, and the words after it are
+/// the command, so it is stepped over like a leading redirect instead of
+/// truncating the segment at it (#4545).
 /// Callers must still gate on [`contains_unattestable_construct`] first.
 pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
     split_segments(cmd, true)
@@ -745,9 +769,17 @@ fn split_segments(cmd: &str, truncate_at_redirect: bool) -> Vec<&str> {
             } else if truncate_at_redirect && seg_end.is_none() {
                 seg_end = Some(tok.offset);
             }
-        } else if tok.kind == TokenKind::Arg
-            || (tok.kind == TokenKind::Shellism && !is_grammar_word(&tok.value))
-        {
+        } else if tok.kind == TokenKind::Arg {
+            // A `NAME=…` word is environment for the command that follows it,
+            // not command text: a redirect glued to it (`FOO=a>/dev/null`)
+            // hits the no-text branch below and is stepped over with its
+            // operand, so the gate sees `git push` and not just `FOO=a`
+            // (#4545). Token text keeps quotes, so a command named `"FOO=a"`
+            // is still text.
+            if seg_has_text || !is_assignment_word(&tok.value) {
+                seg_has_text = true;
+            }
+        } else if tok.kind == TokenKind::Shellism && !is_grammar_word(&tok.value) {
             seg_has_text = true;
         }
 
@@ -1955,6 +1987,49 @@ mod tests {
         assert_eq!(
             split_for_permissions("git push --force 2>&1"),
             vec!["git push --force"]
+        );
+    }
+
+    #[test]
+    fn test_split_perms_assignment_redirect_does_not_hide_the_command() {
+        // `FOO=a>/dev/null git push` runs `git push` — the redirect belongs to
+        // the assignment's null command, so the words after it are the command
+        // the gate must see, not the assignment alone (#4545).
+        assert_eq!(
+            split_for_permissions("FOO=a>/dev/null git push"),
+            vec!["git push"]
+        );
+        assert_eq!(
+            split_for_permissions("FOO=a >/dev/null git push"),
+            vec!["git push"]
+        );
+        assert_eq!(
+            split_for_permissions("FOO=a>/dev/null git push && ls"),
+            vec!["git push", "ls"]
+        );
+        assert_eq!(
+            // The leading redirect is stepped over with its operand only; the
+            // assignment after it rides along at the head of the segment, the
+            // same segment `FOO=1 git push` would produce with no redirect at
+            // all (plain prefixed denies are #4284's scope).
+            split_for_permissions(">/dev/null FOO=1 git push"),
+            vec!["FOO=1 git push"]
+        );
+    }
+
+    #[test]
+    fn test_split_perms_assignment_prefix_keeps_truncation_after_command_text() {
+        // Command text before the redirect still truncates there, assignment
+        // prefix included, exactly as before #4545.
+        assert_eq!(
+            split_for_permissions("FOO=a git push >out"),
+            vec!["FOO=a git push"]
+        );
+        // A quoted `"FOO=a"` is a command named `FOO=a`, not an assignment
+        // (token text keeps the quote), so the redirect stays a trailing one.
+        assert_eq!(
+            split_for_permissions(r#""FOO=a">/dev/null git push"#),
+            vec![r#""FOO=a""#]
         );
     }
 

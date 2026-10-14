@@ -719,22 +719,20 @@ fn strip_trailing_redirects(cmd: &str) -> (&str, &str) {
 }
 
 /// Matches a bash line-continuation: a backslash immediately followed by
-/// `\n` or `\r\n`, *plus* any horizontal whitespace on the line before AND
-/// after the break. This is what bash already collapses to a single space
-/// before executing the command — rtk's hook matcher needs to do the same
-/// so commands authored across multiple lines still hit the rewrite rules.
-/// Consuming the trailing whitespace prevents double spaces in cases like
-/// `git diff \<NL>HEAD~1`.
-static LINE_CONTINUATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)[ \t\x0B\x0C]*\\\r?\n[ \t\x0B\x0C]*").unwrap());
-
+/// `\n` or `\r\n`. bash removes exactly these two bytes and joins the words
+/// either side with nothing (`rm\<NL>-rf x` runs `rm-rf x`), so rtk's hook
+/// matcher and rewriter must do the same — joining with a space instead
+/// authored a different command (#4545). Horizontal whitespace around the
+/// break is kept; every consumer normalizes it.
 static BASH_JOIN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\\r?\n").unwrap());
 
-/// Replace every bash line continuation with a single space, mirroring what
-/// bash does before dispatching the command. Returns a borrowed `&str` when the
-/// input contains no continuations, so the common fast path allocates nothing.
+/// Remove every bash line continuation, mirroring what bash does before
+/// dispatching the command: the backslash and the newline are deleted and the
+/// bytes either side are joined with nothing. Returns a borrowed `&str` when
+/// the input contains no continuations, so the common fast path allocates
+/// nothing.
 pub(crate) fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
-    LINE_CONTINUATION_RE.replace_all(s, " ")
+    BASH_JOIN_RE.replace_all(s, "")
 }
 
 /// Returns `None` if the command is unsupported or ignored (hook should pass through).
@@ -781,7 +779,8 @@ pub(crate) fn rewrite_command_precompiled(
     normalized_prefixes: &[String],
 ) -> Option<String> {
     // Bash joins `\<NL>` with nothing, so `<<` or `$((` can arrive split across
-    // a continuation; the space-join below would erase them (#3188 review).
+    // a continuation; the collapse below erases them the same way, and either
+    // way a heredoc or arithmetic expansion means hands off (#3188 review).
     if cmd.contains('\\') {
         let joined = BASH_JOIN_RE.replace_all(cmd, "");
         if has_heredoc(&joined) || joined.contains("$((") {
@@ -789,10 +788,9 @@ pub(crate) fn rewrite_command_precompiled(
         }
     }
 
-    // Bash line continuations (`\<NL>`, `\<CRLF>`) and the leading whitespace that
-    // follows are syntactically equivalent to a single space, but `cmd.trim()` does
-    // not unwrap them so a leading backslash-newline used to defeat the whole matcher.
-    // Normalize first, then trim. See issue #1564.
+    // Bash line continuations (`\<NL>`, `\<CRLF>`) are removed outright, but
+    // `cmd.trim()` does not unwrap them so a leading backslash-newline used to
+    // defeat the whole matcher. Normalize first, then trim. See issue #1564.
     let normalized = collapse_line_continuations(cmd);
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
@@ -1660,6 +1658,25 @@ fn rewrite_shell_wrapper(
         shell_wrapper_depth + 1,
     )?;
     wrapper.replace_script(command, &rewritten)
+}
+
+/// Whether the rewrite replaces the script inside the quoted shell wrapper at
+/// `command` — the permission gate's read of what the rewrite itself does at a
+/// position [`shell_wrapper_positions`] yields, instead of the gate
+/// re-deriving the rewrite's reach with shallower rules (#4545). This runs the
+/// same [`rewrite_shell_wrapper`] the rewrite walk runs, at the same depth
+/// (0 — prefix peels never nest wrappers), so the two cannot drift.
+///
+/// Excludes are deliberately not consulted: the gate answers before `decide`
+/// re-runs the real rewrite with them, and a command the excludes keep
+/// untouched produces no rewrite for any verdict, so the difference never
+/// reaches an exit code.
+pub(crate) fn wrapper_script_changed_by_rewrite(
+    command: &str,
+    transparent_prefixes: &[String],
+) -> bool {
+    rewrite_shell_wrapper(command, &[], transparent_prefixes, 0)
+        .is_some_and(|rewritten| rewritten != command)
 }
 
 fn is_excluded(cmd: &str, excluded: &[ExcludePattern]) -> bool {
@@ -7954,6 +7971,38 @@ mod tests {
         assert_eq!(
             collapse_line_continuations("git diff HEAD~1"),
             std::borrow::Cow::<str>::Borrowed("git diff HEAD~1"),
+        );
+    }
+
+    #[test]
+    fn test_collapse_line_continuations_deletes_like_bash() {
+        // bash removes `\<NL>` and joins the words either side with nothing;
+        // substituting a space authored a different command: `rm\<NL>-rf x`
+        // runs `rm-rf x`, not `rm -rf x` (#4545).
+        assert_eq!(
+            collapse_line_continuations("rm\\\n-rf x"),
+            std::borrow::Cow::<str>::Owned("rm-rf x".into()),
+        );
+        // Horizontal whitespace around the break is kept, not consumed: bash
+        // only removes the backslash and the newline itself.
+        assert_eq!(
+            collapse_line_continuations("git \\\n    diff HEAD~1"),
+            std::borrow::Cow::<str>::Owned("git     diff HEAD~1".into()),
+        );
+        assert_eq!(
+            collapse_line_continuations("a\\\r\nb"),
+            std::borrow::Cow::<str>::Owned("ab".into()),
+        );
+    }
+
+    #[test]
+    fn test_rewrite_joins_continuation_without_a_space() {
+        // `git c\<NL>heckout -b x` is `git checkout -b x` to bash; the
+        // space-join saw `git c heckout -b x` and refused to rewrite it
+        // (#4545).
+        assert_eq!(
+            rewrite_command_no_prefixes("git c\\\nheckout -b x", &[]),
+            Some("rtk git checkout -b x".into())
         );
     }
 

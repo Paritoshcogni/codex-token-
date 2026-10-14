@@ -86,9 +86,14 @@ name that is merely an argument (`grep -rn bash -c src`) is not a wrapper. A
 deny rule matching an inner segment yields `Defer`: RTK neither rewrites nor
 decides, so the host sees the command exactly as typed.
 A wrapper at the start of a segment is never auto-allowed: its strongest RTK
-verdict is `Ask`. A wrapper behind a prefix is only checked for deny rules and
-otherwise keeps the outer command's verdict, as on master. Ask-capable hosts
-prompt, while other hosts retain their existing native permission flow.
+verdict is `Ask`. Behind a prefix the rewrite reaches the same wrappers, and
+when it changes a wrapper's script inside — `env bash -c 'git status'` under
+an `env:*` allow — the gate asks as well, instead of letting the outer rule
+auto-allow a line RTK rewrote; it reads the rewrite's own verdict on the
+script it reached (`registry::wrapper_script_changed_by_rewrite`). A wrapper
+the rewrite parses but leaves unchanged (`bash -lc '…'`, a script with no RTK
+equivalent) keeps the outer command's verdict. Ask-capable hosts prompt, while
+other hosts retain their existing native permission flow (#4545).
 Unsupported or ambiguous wrapper syntax is left unchanged for the host to
 evaluate. Line continuations are joined before the check, as the rewrite joins
 them.
