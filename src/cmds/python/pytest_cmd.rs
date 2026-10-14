@@ -4,7 +4,7 @@ use crate::core::config;
 use crate::core::runner;
 use crate::core::shell::display_args;
 use crate::core::truncate::CAP_WARNINGS;
-use crate::core::utils::{fallback_tail, resolved_command, strip_ansi, tool_exists, truncate};
+use crate::core::utils::{resolved_command, strip_ansi, tool_exists, truncate};
 use anyhow::Result;
 
 const MAX_XFAIL: usize = CAP_WARNINGS;
@@ -65,7 +65,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         &display_args(args),
         move |raw, exit_code| {
             if is_passthrough_cmd {
-                return fallback_tail(&strip_ansi(raw), "pytest", 60);
+                return strip_ansi(raw);
             }
             resolve_pytest_summary(raw, exit_code)
         },
