@@ -567,7 +567,7 @@ pub fn cli_name() -> String {
         .unwrap_or_else(|| "rtk".to_string())
 }
 
-/// Whether the proxy is running right now, on the default bind — for
+/// Whether the proxy is running right now, on the configured bind — for
 /// `rtk gain` to decide whether to auto-launch `--watch`. Bounded to a short
 /// timeout (localhost only) so a bare `rtk gain` stays snappy even when the
 /// proxy isn't running.
@@ -590,9 +590,9 @@ pub fn is_reachable() -> bool {
 /// common case and needs a different instruction from not-started: telling
 /// someone to start a daemon they have just started sends them in a circle,
 /// and the step they are actually missing is pointing an agent at it.
-pub fn no_data_hint() -> String {
+fn no_data_hint_for(bind: &str, reachable: bool) -> String {
     let cli = cli_name();
-    if !is_reachable() {
+    if !reachable {
         return format!("no data yet — run `{cli} llm-proxy start`");
     }
     let launchers = PROXY_AGENTS
@@ -600,7 +600,13 @@ pub fn no_data_hint() -> String {
         .map(|a| format!("`{cli} {}`", a.name))
         .collect::<Vec<_>>()
         .join(" or ");
-    format!("running on {DEFAULT_BIND} · no agent routed through it — launch one with {launchers}")
+    format!("running on {bind} · no agent routed through it — launch one with {launchers}")
+}
+
+pub fn no_data_hint() -> String {
+    let bind = daemon_bind();
+    let reachable = health_check_with_timeout(&bind, Duration::from_millis(150));
+    no_data_hint_for(&bind, reachable)
 }
 
 /// An agent `rtk <agent>` can launch through the proxy.
@@ -662,9 +668,10 @@ pub fn run_agent(agent: &ProxyAgent, args: &[String]) -> Result<i32> {
         eprintln!("rtk: `{}` is not on PATH", agent.name);
         return Ok(127);
     }
-    let base_url = format!("http://{DEFAULT_BIND}");
+    let bind = daemon_bind();
+    let base_url = format!("http://{bind}");
     let existing = std::env::var(agent.base_url_var).ok();
-    let daemon_up = match ensure_running(DEFAULT_BIND) {
+    let daemon_up = match ensure_running(&bind) {
         Ok(_) => true,
         Err(e) => {
             eprintln!("rtk: proxy unavailable ({e:#})");
@@ -745,7 +752,7 @@ fn run_setup() -> Result<()> {
 }
 
 fn run_start(bind: Option<&str>, env_only: bool) -> Result<()> {
-    let bind = bind.unwrap_or(DEFAULT_BIND).to_string();
+    let bind = bind.map(str::to_owned).unwrap_or_else(daemon_bind);
     let started = ensure_running(&bind)?;
 
     if env_only {
@@ -1212,6 +1219,20 @@ mod tests {
 #[cfg(test)]
 mod no_data_hint_tests {
     use super::*;
+
+    #[test]
+    fn daemon_bind_honors_environment_override() {
+        crate::core::user_env::with_vars(&[("RTK_PROXY_BIND", Some("127.0.0.1:8580"))], || {
+            assert_eq!(daemon_bind(), "127.0.0.1:8580")
+        });
+    }
+
+    #[test]
+    fn reachable_hint_names_configured_bind() {
+        let bind = "127.0.0.1:8580";
+        let hint = no_data_hint_for(bind, true);
+        assert!(hint.contains(bind), "{hint}");
+    }
 
     /// The daemon's reachability decides the instruction. The unreachable arm is
     /// the only one assertable without a listener; the reachable arm is covered
