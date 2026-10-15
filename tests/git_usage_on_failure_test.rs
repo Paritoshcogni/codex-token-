@@ -200,3 +200,67 @@ fn log_failure_preserves_both_output_streams() {
         assert_eq!(got.stderr, want.stderr, "stderr: {args:?}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn clustered_log_help_is_forwarded_once_even_when_git_exits_zero() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let git = dir.path().join("git");
+    std::fs::write(&git, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$RTK_HELP_TRACE\"\nprintf 'usage: git log [options]\\n'\n").unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(dir.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    for flag in ["-hp", "-ph"] {
+        let trace = dir.path().join("calls");
+        let _ = std::fs::remove_file(&trace);
+        let got = common::rtk_command()
+            .env("PATH", &path)
+            .env("RTK_HELP_TRACE", &trace)
+            .args(["git", "log", flag])
+            .output()
+            .unwrap();
+        assert_eq!(got.status.code(), Some(0));
+        assert_eq!(got.stdout, b"usage: git log [options]\n", "{flag}");
+        assert!(
+            got.stderr.is_empty(),
+            "{flag}: {:?}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&trace).unwrap(),
+            format!("log\n{flag}\n"),
+            "no cap or probe for {flag}"
+        );
+    }
+    for args in [
+        vec!["-Shp"],
+        vec!["-Ghp"],
+        vec!["-Sh"],
+        vec!["-Gh"],
+        vec!["-S", "h"],
+        vec!["-G", "h"],
+        vec!["-S", "-hp"],
+        vec!["-G", "-hp"],
+        vec!["--", "-hp"],
+    ] {
+        let trace = dir.path().join("values");
+        let _ = std::fs::remove_file(&trace);
+        let got = common::rtk_command()
+            .env("PATH", &path)
+            .env("RTK_HELP_TRACE", &trace)
+            .args(["git", "log"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(got.status.success());
+        assert!(
+            std::fs::read_to_string(&trace)
+                .unwrap()
+                .contains("--pretty=format:"),
+            "{args:?} is data, not help"
+        );
+    }
+}

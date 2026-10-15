@@ -1664,6 +1664,16 @@ fn run_log(
     let tracked = with_args("git log", &display_args(args));
     let tokens = tokenize_git_log_args(args);
 
+    // Git may answer clustered help (`-hp`) with exit 0. Forward it once before
+    // a cap/probe can mistake the usage page for commits. The grammar keeps
+    // option values (`-Sh`) and paths after `--` from becoming help flags.
+    if tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Short && t.text == "h")
+    {
+        return run_passthrough(&raw_log_passthrough_args(args, false), global_args, verbose);
+    }
+
     if tokens.iter().any(|t| log_wants_raw_shape(t, &tokens)) {
         let capped = raw_log_is_capped(&tokens);
         let passthrough_args = raw_log_passthrough_args(args, capped);
