@@ -9,6 +9,7 @@
 - `sqlfluff_cmd.rs` injects `--format json` for lint mode and groups violations by rule and file; other subcommands pass through capped
 - `pip_cmd.rs` auto-detects `uv` as a pip alternative and routes accordingly
 - `uv_cmd.rs` preserves `uv run` environment semantics: the program's own output passes through on success (bounded, with a tee hint), diagnostics are extracted on failure
+- `poetry_cmd.rs` mirrors `uv_cmd.rs` for `poetry run` only: the program's own output passes through on success, help and version requests run unfiltered, diagnostics are extracted on failure; other poetry subcommands keep the TOML filters
 - `python -m pytest` and `python3 -m mypy` are rewritten by the hook registry to `rtk pytest` / `rtk mypy`
 
 ## Cross-command
