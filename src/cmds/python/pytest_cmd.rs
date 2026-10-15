@@ -6,7 +6,7 @@ use crate::core::truncate::CAP_WARNINGS;
 use crate::core::utils::{resolve_binary, resolved_command, strip_ansi, truncate};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const MAX_XFAIL: usize = CAP_WARNINGS;
 const MAX_PYTEST_FAILURES: usize = CAP_WARNINGS;
@@ -56,13 +56,26 @@ fn venv_executable(root: &Path, tool: &str) -> PathBuf {
     }
 }
 
-fn resolve_pytest_invocation<F>(
+fn python_has_pytest(python: &Path) -> bool {
+    // Probe availability before running tests; a test failure must never select another runner.
+    Command::new(python)
+        .args(["-c", "import pytest"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn resolve_pytest_invocation<F, P>(
     virtual_env: Option<&Path>,
     project_dir: &Path,
     mut resolve_on_path: F,
+    mut has_pytest: P,
 ) -> Option<PytestInvocation>
 where
     F: FnMut(&str) -> Option<PathBuf>,
+    P: FnMut(&Path) -> bool,
 {
     let mut environment_roots = Vec::new();
     if let Some(root) = virtual_env.filter(|root| !root.as_os_str().is_empty()) {
@@ -79,11 +92,8 @@ where
         if pytest.is_file() {
             return Some(PytestInvocation::Executable(pytest));
         }
-    }
-
-    for root in &environment_roots {
         let python = venv_executable(root, "python");
-        if python.is_file() {
+        if python.is_file() && has_pytest(&python) {
             return Some(PytestInvocation::PythonModule(python));
         }
     }
@@ -93,7 +103,9 @@ where
     }
     for python_name in ["python", "python3"] {
         if let Some(python) = resolve_on_path(python_name) {
-            return Some(PytestInvocation::PythonModule(python));
+            if has_pytest(&python) {
+                return Some(PytestInvocation::PythonModule(python));
+            }
         }
     }
 
@@ -107,6 +119,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         virtual_env.as_deref(),
         &project_dir,
         |name| resolve_binary(name).ok(),
+        python_has_pytest,
     )
     .context("pytest not found (checked VIRTUAL_ENV, .venv, venv, and PATH)")?;
     let invocation_display = invocation.display();
@@ -635,7 +648,7 @@ collected 3 items
         let active_pytest = create_venv_tool(&virtual_env, "pytest");
         create_venv_tool(&project.join(".venv"), "pytest");
 
-        let runner = resolve_pytest_invocation(Some(&virtual_env), &project, |_| None);
+        let runner = resolve_pytest_invocation(Some(&virtual_env), &project, |_| None, |_| false);
 
         assert_eq!(runner, Some(PytestInvocation::Executable(active_pytest)));
     }
@@ -646,10 +659,15 @@ collected 3 items
         let project_pytest = create_venv_tool(&temp.path().join(".venv"), "pytest");
         let path_pytest = temp.path().join("path-pytest");
 
-        let runner = resolve_pytest_invocation(None, temp.path(), |name| match name {
-            "pytest" => Some(path_pytest.clone()),
-            _ => None,
-        });
+        let runner = resolve_pytest_invocation(
+            None,
+            temp.path(),
+            |name| match name {
+                "pytest" => Some(path_pytest.clone()),
+                _ => None,
+            },
+            |_| false,
+        );
 
         assert_eq!(runner, Some(PytestInvocation::Executable(project_pytest)));
     }
@@ -659,7 +677,7 @@ collected 3 items
         let temp = tempfile::tempdir().expect("create tempdir");
         let project_python = create_venv_tool(&temp.path().join("venv"), "python");
 
-        let runner = resolve_pytest_invocation(None, temp.path(), |_| None);
+        let runner = resolve_pytest_invocation(None, temp.path(), |_| None, |_| true);
 
         assert_eq!(runner, Some(PytestInvocation::PythonModule(project_python)));
     }
@@ -670,20 +688,30 @@ collected 3 items
         let path_pytest = temp.path().join("path-pytest");
         let path_python3 = temp.path().join("path-python3");
 
-        let pytest_runner = resolve_pytest_invocation(None, temp.path(), |name| match name {
-            "pytest" => Some(path_pytest.clone()),
-            "python3" => Some(path_python3.clone()),
-            _ => None,
-        });
+        let pytest_runner = resolve_pytest_invocation(
+            None,
+            temp.path(),
+            |name| match name {
+                "pytest" => Some(path_pytest.clone()),
+                "python3" => Some(path_python3.clone()),
+                _ => None,
+            },
+            |_| false,
+        );
         assert_eq!(
             pytest_runner,
             Some(PytestInvocation::Executable(path_pytest))
         );
 
-        let python_runner = resolve_pytest_invocation(None, temp.path(), |name| match name {
-            "python3" => Some(path_python3.clone()),
-            _ => None,
-        });
+        let python_runner = resolve_pytest_invocation(
+            None,
+            temp.path(),
+            |name| match name {
+                "python3" => Some(path_python3.clone()),
+                _ => None,
+            },
+            |_| true,
+        );
         assert_eq!(
             python_runner,
             Some(PytestInvocation::PythonModule(path_python3))
@@ -694,9 +722,82 @@ collected 3 items
     fn test_pytest_runner_returns_none_when_no_runner_exists() {
         let temp = tempfile::tempdir().expect("create tempdir");
 
-        let runner = resolve_pytest_invocation(None, temp.path(), |_| None);
+        let runner = resolve_pytest_invocation(None, temp.path(), |_| None, |_| false);
 
         assert_eq!(runner, None);
+    }
+
+    #[test]
+    fn test_pytest_runner_checks_module_before_next_environment() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let active = temp.path().join("active venv");
+        let active_python = create_venv_tool(&active, "python");
+        create_venv_tool(&temp.path().join(".venv"), "pytest");
+
+        let runner = resolve_pytest_invocation(
+            Some(&active),
+            temp.path(),
+            |_| None,
+            |python| python == active_python,
+        );
+
+        assert_eq!(runner, Some(PytestInvocation::PythonModule(active_python)));
+    }
+
+    #[test]
+    fn test_pytest_runner_skips_environments_without_pytest() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let active = temp.path().join("active");
+        create_venv_tool(&active, "python");
+        create_venv_tool(&temp.path().join(".venv"), "python");
+        let venv_python = create_venv_tool(&temp.path().join("venv"), "python");
+
+        let runner = resolve_pytest_invocation(
+            Some(&active),
+            temp.path(),
+            |_| None,
+            |python| python == venv_python,
+        );
+
+        assert_eq!(runner, Some(PytestInvocation::PythonModule(venv_python)));
+    }
+
+    #[test]
+    fn test_pytest_runner_checks_path_python_module_availability() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        create_venv_tool(&temp.path().join(".venv"), "python");
+        let path_python = temp.path().join("python");
+        let path_python3 = temp.path().join("python3");
+
+        for available in [false, true] {
+            let runner = resolve_pytest_invocation(
+                None,
+                temp.path(),
+                |name| match name {
+                    "python" => Some(path_python.clone()),
+                    "python3" => Some(path_python3.clone()),
+                    _ => None,
+                },
+                |python| available && python == path_python3,
+            );
+
+            assert_eq!(
+                runner,
+                available.then(|| PytestInvocation::PythonModule(path_python3.clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_venv_executable_matches_platform_layout() {
+        let root = Path::new("project with spaces");
+        if cfg!(windows) {
+            assert_eq!(venv_executable(root, "python"), root.join("Scripts/python.exe"));
+            assert_eq!(venv_executable(root, "pytest"), root.join("Scripts/pytest.exe"));
+        } else {
+            assert_eq!(venv_executable(root, "python"), root.join("bin/python"));
+            assert_eq!(venv_executable(root, "pytest"), root.join("bin/pytest"));
+        }
     }
 
     #[test]
