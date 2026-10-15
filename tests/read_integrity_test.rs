@@ -1,5 +1,7 @@
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
+
+mod common;
 
 const GUARD_SOURCE: &str = r#"fn can_admin(user: &User) -> bool {
     if !user.is_admin {
@@ -19,7 +21,7 @@ fn wipe_database() {
 "#;
 
 fn read_stdin(args: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rtk"))
+    let mut child = common::rtk_command()
         .arg("read")
         .arg("-")
         .args(args)
