@@ -727,13 +727,43 @@ fn program_of(cmd: &Command) -> String {
 
 pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::null());
+    show_usage_if_asked(cmd)?;
     capture(cmd)
 }
 
-/// Like [`exec_capture`] but inherits stdin so a wrapped engine can read a piped stdin.
+/// Like [`exec_capture`] but inherits stdin so a wrapped engine can read a piped stdin, and
+/// without the usage guard: its callers pass the caller's argv through verbatim or decide on
+/// it first.
 pub fn exec_capture_stdin(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::inherit());
     capture(cmd)
+}
+
+/// Like [`exec_capture`] without the usage guard, for an argv whose `--help`, `--version` or
+/// `-h` is not the caller asking the tool for its usage: a probe RTK runs for itself, or a
+/// command whose flags RTK does not read. A caller that has already answered the usage
+/// question on the caller's own argv uses it too.
+pub fn exec_capture_unguarded(cmd: &mut Command) -> Result<CaptureResult> {
+    cmd.stdin(Stdio::null());
+    capture(cmd)
+}
+
+/// A usage page is not the output a filter reads: handed one, a filter built for the tool's
+/// normal output reports an empty run, which is how `pnpm outdated --help` became
+/// "48 outdated packages" and `jest --help` lost 24 KB of its 26 (#4198). Show it as the
+/// tool printed it and end with the tool's own code: there is no captured output to hand
+/// back, and an empty capture would get a summary written under it.
+fn show_usage_if_asked(cmd: &mut Command) -> Result<()> {
+    if !crate::core::runner::requests_help(cmd) {
+        return Ok(());
+    }
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let status = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| exec_error(&program, e))?;
+    std::process::exit(crate::core::utils::exit_code_from_status(&status, &program));
 }
 
 /// Run `cmd` to completion, decode what it wrote, and report the exit code.
@@ -883,6 +913,25 @@ pub(crate) mod tests {
         fn flush(&mut self) -> String {
             String::new()
         }
+    }
+
+    #[test]
+    fn missing_command_keeps_typed_error_when_help_is_requested() {
+        let empty_path = tempfile::tempdir().expect("create empty PATH directory");
+        let mut cmd = Command::new("rtk-missing-stream-help-3273");
+        cmd.arg("--help").env("PATH", empty_path.path());
+
+        let error = match exec_capture(&mut cmd) {
+            Err(error) => error,
+            Ok(_) => panic!("missing command must fail"),
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<CommandNotFound>()
+                .expect("preserve typed command-not-found error")
+                .program,
+            "rtk-missing-stream-help-3273"
+        );
     }
 
     #[test]
