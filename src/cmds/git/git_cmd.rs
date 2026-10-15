@@ -1770,7 +1770,7 @@ fn run_log(
     if !result.success() {
         // git prints some failures (a usage page) on stdout, so forward it as well
         print!("{}", result.stdout);
-        eprintln!("{}", result.stderr);
+        eprint!("{}", result.stderr);
         return Ok(result.exit_code);
     }
 

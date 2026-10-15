@@ -161,3 +161,32 @@ fn stash_pop_conflict_keeps_conflict_report() {
     );
     assert!(got.contains("The stash entry is kept"), "{got}");
 }
+
+#[test]
+fn log_failure_preserves_both_output_streams() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_ok(dir.path(), &["init", "-q"]);
+    for args in [["-m", "-h"], ["--oneline", "missing-revision"]] {
+        let mut native = Command::new("git");
+        common::isolate_git(&mut native);
+        let want = native
+            .arg("-C")
+            .arg(dir.path())
+            .arg("log")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!want.status.success());
+        let mut rtk = common::rtk_command();
+        common::isolate_git(&mut rtk);
+        let got = rtk
+            .args(["git", "log"])
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(got.status.code(), want.status.code(), "{args:?}");
+        assert_eq!(got.stdout, want.stdout, "stdout: {args:?}");
+        assert_eq!(got.stderr, want.stderr, "stderr: {args:?}");
+    }
+}
