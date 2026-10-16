@@ -301,6 +301,7 @@ impl AgentPath {
             "opencode" => Some(Self::InProcess(Host::OpenCode)),
             "hermes" | "omp" | "pi" => Some(Self::ViaRewrite(ApprovalOwner::Rtk)),
             "vibe" => Some(Self::InProcess(Host::Vibe)),
+            "minimax" => Some(Self::InProcess(Host::MiniMax)),
             _ => None,
         }
     }
@@ -318,6 +319,7 @@ impl AgentPath {
         "hermes",
         "kilocode",
         "kimi",
+        "minimax",
         "omp",
         "openclaw",
         "opencode",
