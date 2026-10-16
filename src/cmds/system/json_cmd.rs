@@ -448,8 +448,7 @@ mod tests {
     // extractor must only flag strict ISO dates `YYYY-MM-DD`.
     #[test]
     fn test_extract_schema_eks_cluster_name_is_string_not_date() {
-        let json: Value =
-            serde_json::from_str(r#"{"clusters": ["my-cluster"]}"#).unwrap();
+        let json: Value = serde_json::from_str(r#"{"clusters": ["my-cluster"]}"#).unwrap();
         let schema = extract_schema(&json, 0, 5);
         assert!(
             !schema.contains("date?"),
@@ -463,16 +462,20 @@ mod tests {
     fn test_extract_schema_iso_date_still_flagged() {
         let json: Value = serde_json::from_str(r#"{"birthday": "2024-01-15"}"#).unwrap();
         let schema = extract_schema(&json, 0, 5);
-        assert!(schema.contains("date?"), "ISO date should still be flagged: {}", schema);
+        assert!(
+            schema.contains("date?"),
+            "ISO date should still be flagged: {}",
+            schema
+        );
     }
 
     // Adjacent 10-char dashed strings that aren't dates must classify as string.
     #[test]
     fn test_extract_schema_dashed_non_date_strings() {
         for sample in [
-            "my-cluster",   // EKS cluster name
-            "abcd-12-xy",   // 10-char dashed identifier
-            "foo-bar-ab",   // dashes but not date format
+            "my-cluster", // EKS cluster name
+            "abcd-12-xy", // 10-char dashed identifier
+            "foo-bar-ab", // dashes but not date format
         ] {
             let json: Value = serde_json::from_str(&format!(r#"{{"v": "{}"}}"#, sample)).unwrap();
             let schema = extract_schema(&json, 0, 5);
