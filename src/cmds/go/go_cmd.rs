@@ -880,7 +880,10 @@ mod tests {
     fn test_no_skip_for_run_benchmark_filter() {
         // `-run=BenchmarkX` selects a test by name; it is not `-bench` and must
         // still go through the JSON filter.
-        assert!(!skip_json_injection(&args(&["-run=BenchmarkParse", "./..."])));
+        assert!(!skip_json_injection(&args(&[
+            "-run=BenchmarkParse",
+            "./..."
+        ])));
     }
 
     #[test]
