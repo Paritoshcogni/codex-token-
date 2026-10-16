@@ -7,7 +7,7 @@ use crate::core::runner::{self, RunOptions};
 use crate::core::shell::{display_args, quote_word, with_args};
 use crate::core::stream::{
     self, CaptureResult, FilterMode, LineHandler, LineStreamFilter, StdinMode, exec_capture,
-    exec_capture_stdin,
+    exec_capture_stdin, exec_capture_unguarded,
 };
 use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
@@ -32,6 +32,46 @@ pub enum GitCommand {
     Fetch,
     Stash { subcommand: Option<String> },
     Worktree,
+}
+
+impl GitCommand {
+    /// The word git expects, for rebuilding the argv clap took apart.
+    fn git_name(&self) -> &'static str {
+        match self {
+            GitCommand::Diff => "diff",
+            GitCommand::Log => "log",
+            GitCommand::Status => "status",
+            GitCommand::Show => "show",
+            GitCommand::Add => "add",
+            GitCommand::Commit => "commit",
+            GitCommand::Checkout => "checkout",
+            GitCommand::Push => "push",
+            GitCommand::Pull => "pull",
+            GitCommand::Branch => "branch",
+            GitCommand::Fetch => "fetch",
+            GitCommand::Stash { .. } => "stash",
+            GitCommand::Worktree => "worktree",
+        }
+    }
+}
+
+/// What git would have seen: the caller's own globals, the subcommand clap matched, the
+/// stash subcommand clap carved out of the trailing args, then the rest.
+fn help_passthrough_argv(
+    cmd: &GitCommand,
+    args: &[String],
+    global_args: &[String],
+) -> Vec<OsString> {
+    let mut forwarded: Vec<OsString> = global_args.iter().map(OsString::from).collect();
+    forwarded.push(OsString::from(cmd.git_name()));
+    if let GitCommand::Stash {
+        subcommand: Some(sub),
+    } = cmd
+    {
+        forwarded.push(OsString::from(sub));
+    }
+    forwarded.extend(args.iter().map(OsString::from));
+    forwarded
 }
 
 /// Create a git Command with global options (e.g. -C, -c, --git-dir, --work-tree)
@@ -114,6 +154,15 @@ pub fn run(
         other => (other, args_utils::restore_double_dash(args)),
     };
     let args = &args;
+
+    // Forwarded clean rather than left to the guard in stream::capture: by then RTK has
+    // injected its own globals, and `--no-pager` turns git's man page into a one-screen
+    // usage (#4198).
+    if runner::requests_help_args("git", args) {
+        let forwarded = help_passthrough_argv(&cmd, args, global_args);
+        return runner::run_passthrough("git", &forwarded, verbose);
+    }
+
     match cmd {
         GitCommand::Diff => run_diff(args, max_lines, verbose, global_args),
         GitCommand::Log => run_log(args, max_lines, verbose, global_args),
@@ -904,7 +953,7 @@ fn commit_or_stat_route(args: &[String]) -> ShowRoute {
 fn probe_is_blob(global_args: &[String], arg: &str) -> bool {
     let mut cmd = git_cmd(global_args);
     cmd.args(["cat-file", "-t", arg]);
-    match exec_capture(&mut cmd) {
+    match exec_capture_unguarded(&mut cmd) {
         Ok(result) if result.success() => result.stdout.trim() == "blob",
         _ => false,
     }
@@ -1564,7 +1613,7 @@ fn walk_exceeds_limit(
     }
     cmd.args(log_probe_args(args, tokens));
 
-    let result = exec_capture(&mut cmd).ok()?;
+    let result = exec_capture_unguarded(&mut cmd).ok()?;
     if !result.success() {
         return None;
     }
@@ -1824,8 +1873,9 @@ fn run_log(
         // keeps the small codes for what the diff machinery found in a walk it ran and
         // printed in full -- 1 for `--exit-code`'s differences, 2 for `--check`'s whitespace
         // errors. Reading the boundary rather than the flags keeps the next such flag from
-        // silencing the notice again.
-        let refused = result.exit_code >= REFUSAL_EXIT_CODE;
+        // silencing the notice again. The one exception is `-h`: git 2.56 answers it with
+        // its usage and exit 0, so a walk that never ran looks like one that did.
+        let refused = result.exit_code >= REFUSAL_EXIT_CODE || asks_for_usage(&tokens);
         if !refused
             && walk_exceeds_limit(global_args, args, &tokens, DEFAULT_LOG_LIMIT) == Some(true)
         {
@@ -2025,6 +2075,15 @@ fn real_flag_args(args: &[String]) -> Vec<&str> {
         .filter(|t| matches!(t.kind, TokenKind::Long | TokenKind::Short))
         .map(|t| t.text)
         .collect()
+}
+
+/// True when the args hold a `-h` flag, alone or in a cluster, which git answers with its usage
+/// instead of the walk. A `-h` that is a flag's value (`--grep -h`) or a pathspec (`-- -h`)
+/// is not a flag token and runs the walk like any other.
+fn asks_for_usage(tokens: &[Token<'_>]) -> bool {
+    tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Short && t.text == "h")
 }
 
 /// True for git log flags that change the *shape* of git's raw output (patch text, diffstat,
@@ -3771,6 +3830,66 @@ pub fn run_passthrough(args: &[OsString], global_args: &[String], verbose: u8) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What reaches git decides which page comes back, and a wrong subcommand still returns
+    /// a plausible one. Pins every part the argv is assembled from.
+    #[test]
+    fn help_passthrough_argv_is_what_git_would_have_seen() {
+        let owned = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let argv = |cmd: &GitCommand, args: &[&str], globals: &[&str]| -> Vec<String> {
+            help_passthrough_argv(cmd, &owned(args), &owned(globals))
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            argv(&GitCommand::Log, &["--help"], &[]),
+            vec!["log", "--help"]
+        );
+        // The caller's own globals come first, the way they were typed.
+        assert_eq!(
+            argv(&GitCommand::Status, &["--help"], &["-C", "/tmp"]),
+            vec!["-C", "/tmp", "status", "--help"]
+        );
+        // clap carves the stash subcommand out of the trailing args; it has to go back.
+        assert_eq!(
+            argv(
+                &GitCommand::Stash {
+                    subcommand: Some("list".into())
+                },
+                &["-h"],
+                &["-C", "/tmp"]
+            ),
+            vec!["-C", "/tmp", "stash", "list", "-h"]
+        );
+        assert_eq!(
+            argv(&GitCommand::Stash { subcommand: None }, &["--help"], &[]),
+            vec!["stash", "--help"]
+        );
+    }
+
+    /// Every arm, so `Status => "diff"` cannot pass by returning a page that is merely long.
+    #[test]
+    fn git_name_round_trips_every_subcommand() {
+        for (cmd, name) in [
+            (GitCommand::Diff, "diff"),
+            (GitCommand::Log, "log"),
+            (GitCommand::Status, "status"),
+            (GitCommand::Show, "show"),
+            (GitCommand::Add, "add"),
+            (GitCommand::Commit, "commit"),
+            (GitCommand::Checkout, "checkout"),
+            (GitCommand::Push, "push"),
+            (GitCommand::Pull, "pull"),
+            (GitCommand::Branch, "branch"),
+            (GitCommand::Fetch, "fetch"),
+            (GitCommand::Worktree, "worktree"),
+            (GitCommand::Stash { subcommand: None }, "stash"),
+        ] {
+            assert_eq!(cmd.git_name(), name, "{cmd:?}");
+        }
+    }
     use crate::core::test_isolation;
 
     #[test]
@@ -5493,6 +5612,25 @@ A  added.rs
             assert!(
                 requests_raw_log_output(&args),
                 "{flag} changes output shape and should request raw output"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_h_asks_for_usage_but_a_value_or_pathspec_does_not() {
+        for (args, expected) in [
+            (vec!["-hp"], true),
+            (vec!["-p", "-h"], true),
+            (vec!["-p"], false),
+            (vec!["--grep", "-h"], false),
+            (vec!["--grep=-h"], false),
+            (vec!["-p", "--", "-h"], false),
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(
+                asks_for_usage(&tokenize_git_log_args(&args)),
+                expected,
+                "{args:?}"
             );
         }
     }
