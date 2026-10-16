@@ -4673,6 +4673,7 @@ mod tests {
             "bunx",
             "deno",
         ];
+        const NATIVE: &[&str] = &["cmake", "make", "ninja", "msbuild"];
 
         let unclassified: Vec<String> = Cli::command()
             .get_subcommands()
@@ -4680,6 +4681,7 @@ mod tests {
             .filter(|name| {
                 !core::constants::RTK_META_COMMANDS.contains(&name.as_str())
                     && !PASSTHROUGH.contains(&name.as_str())
+                    && !NATIVE.contains(&name.as_str())
             })
             .collect();
 
