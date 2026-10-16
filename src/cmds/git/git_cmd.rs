@@ -1873,8 +1873,9 @@ fn run_log(
         // keeps the small codes for what the diff machinery found in a walk it ran and
         // printed in full -- 1 for `--exit-code`'s differences, 2 for `--check`'s whitespace
         // errors. Reading the boundary rather than the flags keeps the next such flag from
-        // silencing the notice again.
-        let refused = result.exit_code >= REFUSAL_EXIT_CODE;
+        // silencing the notice again. The one exception is `-h`: git 2.56 answers it with
+        // its usage and exit 0, so a walk that never ran looks like one that did.
+        let refused = result.exit_code >= REFUSAL_EXIT_CODE || asks_for_usage(&tokens);
         if !refused
             && walk_exceeds_limit(global_args, args, &tokens, DEFAULT_LOG_LIMIT) == Some(true)
         {
@@ -2074,6 +2075,15 @@ fn real_flag_args(args: &[String]) -> Vec<&str> {
         .filter(|t| matches!(t.kind, TokenKind::Long | TokenKind::Short))
         .map(|t| t.text)
         .collect()
+}
+
+/// True when the args hold a `-h` flag, alone or in a cluster, which git answers with its usage
+/// instead of the walk. A `-h` that is a flag's value (`--grep -h`) or a pathspec (`-- -h`)
+/// is not a flag token and runs the walk like any other.
+fn asks_for_usage(tokens: &[Token<'_>]) -> bool {
+    tokens
+        .iter()
+        .any(|t| t.kind == TokenKind::Short && t.text == "h")
 }
 
 /// True for git log flags that change the *shape* of git's raw output (patch text, diffstat,
@@ -5602,6 +5612,25 @@ A  added.rs
             assert!(
                 requests_raw_log_output(&args),
                 "{flag} changes output shape and should request raw output"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_h_asks_for_usage_but_a_value_or_pathspec_does_not() {
+        for (args, expected) in [
+            (vec!["-hp"], true),
+            (vec!["-p", "-h"], true),
+            (vec!["-p"], false),
+            (vec!["--grep", "-h"], false),
+            (vec!["--grep=-h"], false),
+            (vec!["-p", "--", "-h"], false),
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(
+                asks_for_usage(&tokenize_git_log_args(&args)),
+                expected,
+                "{args:?}"
             );
         }
     }
