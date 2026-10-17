@@ -336,25 +336,31 @@ pub fn run(
 ) -> Result<()> {
     let provider = ClaudeProvider;
 
-    // Determine project filter
-    let scope = if all {
-        report::ScanScope::AllProjects
-    } else if let Some(p) = project {
-        report::ScanScope::ProjectFilter(p.to_string())
+    // Determine project filter. `scope` drives the report header (Claude-style
+    // display); `filter` is raw filesystem scoping the provider translates
+    // itself, so a non-Claude provider can be dropped in without touching this.
+    let cwd = if all || project.is_some() {
+        None
     } else {
         // Default: current working directory
-        let cwd = user_dirs::current_dir()?;
-        let cwd_str = cwd.to_string_lossy().to_string();
-        report::ScanScope::CurrentProject(ClaudeProvider::encode_project_path(&cwd_str))
+        Some(user_dirs::current_dir()?)
     };
-    let project_filter = match &scope {
-        report::ScanScope::AllProjects => None,
-        report::ScanScope::ProjectFilter(f) | report::ScanScope::CurrentProject(f) => {
-            Some(f.as_str())
-        }
+    let (scope, filter) = match (all, project, cwd.as_deref()) {
+        (true, _, _) => (report::ScanScope::AllProjects, provider::ProjectFilter::All),
+        (false, Some(p), _) => (
+            report::ScanScope::ProjectFilter(p.to_string()),
+            provider::ProjectFilter::Substring(p),
+        ),
+        (false, None, Some(cwd)) => (
+            report::ScanScope::CurrentProject(ClaudeProvider::encode_project_path(
+                &cwd.to_string_lossy(),
+            )),
+            provider::ProjectFilter::CurrentProject(cwd),
+        ),
+        (false, None, None) => (report::ScanScope::AllProjects, provider::ProjectFilter::All),
     };
 
-    let sessions = provider.discover_sessions(project_filter, Some(since_days))?;
+    let sessions = provider.discover_sessions(filter, Some(since_days))?;
 
     if verbose > 0 {
         eprintln!("Scanning {} session files...", sessions.len());
@@ -436,12 +442,12 @@ pub fn run(
     let mut supported_map: HashMap<&'static str, SupportedBucket> = HashMap::new();
     let mut unsupported_map: HashMap<String, UnsupportedBucket> = HashMap::new();
 
-    for session_path in &sessions {
-        let extracted = match provider.extract_commands(session_path) {
+    for session in &sessions {
+        let extracted = match provider.extract_commands(session) {
             Ok(cmds) => cmds,
             Err(e) => {
                 if verbose > 0 {
-                    eprintln!("Warning: skipping {}: {}", session_path.display(), e);
+                    eprintln!("Warning: skipping {}: {}", session.display(), e);
                 }
                 parse_errors += 1;
                 continue;
