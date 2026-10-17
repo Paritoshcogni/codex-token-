@@ -209,7 +209,7 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     if report.sessions_scanned == 0 {
         match &report.scope {
             ScanScope::AllProjects => out.push_str(&format!(
-                "\nNo Claude Code sessions found in any project in the last {} days.\n",
+                "\nNo sessions found in any project in the last {} days.\n",
                 report.since_days
             )),
             ScanScope::ProjectFilter(filter) => out.push_str(&format!(
@@ -328,15 +328,15 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
 
 fn append_agent_notes(out: &mut String, status: AgentIntegrationStatus) {
     if status.cursor_hook_installed {
-        out.push_str("\nNote: Cursor sessions are tracked via `rtk gain` (discover scans Claude Code only)\n");
+        out.push_str("\nNote: Cursor sessions are tracked via `rtk gain` (discover scans Claude Code and OpenCode only)\n");
     }
 
     if status.hermes_plugin_installed {
-        out.push_str("\nNote: Hermes plugin is installed; Hermes sessions are tracked via `rtk gain` (discover scans Claude Code only)\n");
+        out.push_str("\nNote: Hermes plugin is installed; Hermes sessions are tracked via `rtk gain` (discover scans Claude Code and OpenCode only)\n");
     }
 
     if status.copilot_hook_installed {
-        out.push_str("\nNote: GitHub Copilot sessions are tracked via `rtk gain` (discover scans Claude Code only)\n");
+        out.push_str("\nNote: GitHub Copilot sessions are tracked via `rtk gain` (discover scans Claude Code and OpenCode only)\n");
     }
 }
 
@@ -552,7 +552,7 @@ mod tests {
 
         let output = format_text(&report, 10, false);
 
-        assert!(output.contains("No Claude Code sessions found in any project in the last 7 days"));
+        assert!(output.contains("No sessions found in any project in the last 7 days"));
         assert!(!output.contains("rtk discover --all"));
         assert!(!output.contains("RTK usage looks good"));
     }
