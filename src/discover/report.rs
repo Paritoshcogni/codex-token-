@@ -108,6 +108,10 @@ pub enum ScanScope {
 #[derive(Debug, Serialize)]
 pub struct DiscoverReport {
     pub sessions_scanned: usize,
+    /// Sessions that came from the OpenCode provider. Coverage (hook-decision
+    /// ground truth or current-state estimate) is not measured for those, so
+    /// the text report says so whenever this is non-zero.
+    pub opencode_sessions: usize,
     /// Which sessions the scan covered. Drives the zero-session message only; not
     /// serialized, because a JSON consumer already knows which flags it passed.
     #[serde(skip)]
@@ -181,6 +185,12 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
             0.0
         }
     ));
+    if report.opencode_sessions > 0 {
+        out.push_str(&format!(
+            "  note: coverage is not measured for {} OpenCode session(s) — no hook-decision log exists for OpenCode\n",
+            report.opencode_sessions
+        ));
+    }
     if report.already_rtk_estimated > 0 {
         match &report.measured_since {
             Some(date) => out.push_str(&format!(
@@ -366,6 +376,7 @@ mod tests {
     fn make_report(total_commands: usize, already_rtk: usize) -> DiscoverReport {
         DiscoverReport {
             sessions_scanned: 1,
+            opencode_sessions: 0,
             scope: ScanScope::CurrentProject("-home-user-proj".to_string()),
             total_commands,
             already_rtk,
@@ -380,6 +391,17 @@ mod tests {
             rtk_disabled_examples: vec![],
             agent_status: AgentIntegrationStatus::default(),
         }
+    }
+
+    #[test]
+    fn test_format_text_notes_unmeasured_opencode_coverage() {
+        let mut report = make_report(100, 10);
+        report.opencode_sessions = 3;
+        let output = format_text(&report, 10, false);
+        assert!(output.contains("coverage is not measured for 3 OpenCode session(s)"));
+        // A Claude-only run must not carry the note.
+        report.opencode_sessions = 0;
+        assert!(!format_text(&report, 10, false).contains("coverage is not measured"));
     }
 
     #[test]

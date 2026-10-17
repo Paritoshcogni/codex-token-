@@ -14,10 +14,6 @@
 //!
 //! Verified against OpenCode v2.0.29.
 
-// The provider is wired into `discover::run` by the `--agent` task of this
-// change; until that lands nothing outside tests constructs it.
-#![allow(dead_code)]
-
 use super::provider::{ExtractedCommand, ProjectFilter, SessionProvider, SessionRef};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
@@ -31,7 +27,7 @@ const OUTPUT_CONTENT_MAX: usize = 1000;
 /// Default database location: `$XDG_DATA_HOME/opencode/opencode.db`, falling
 /// back to `~/.local/share/opencode/opencode.db` where the XDG base is unset.
 pub fn db_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("opencode").join("opencode.db"))
+    crate::core::user_dirs::data_local().map(|d| d.join("opencode").join("opencode.db"))
 }
 
 /// Session provider backed by OpenCode's SQLite store.
@@ -55,14 +51,9 @@ impl OpenCodeProvider {
     }
 
     /// Provider for an explicit database path (tests).
+    #[cfg(test)]
     pub fn with_db_path(db: PathBuf) -> Self {
         Self { db }
-    }
-
-    /// Whether OpenCode storage exists at all. A never-installed OpenCode must
-    /// stay fully silent (design D4).
-    pub fn available(&self) -> bool {
-        self.db.is_file()
     }
 
     /// Open the database strictly read-only. WAL-mode files that need
@@ -87,6 +78,12 @@ fn now_millis() -> i64 {
 }
 
 impl SessionProvider for OpenCodeProvider {
+    /// Whether OpenCode storage exists at all. A never-installed OpenCode must
+    /// stay fully silent (design D4).
+    fn available(&self) -> bool {
+        self.db.is_file()
+    }
+
     fn discover_sessions(
         &self,
         filter: ProjectFilter<'_>,

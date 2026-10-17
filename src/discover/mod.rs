@@ -12,7 +12,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use provider::{ClaudeProvider, SessionProvider};
+use opencode_provider::OpenCodeProvider;
+use provider::{ClaudeProvider, SessionProvider, SessionRef};
 use registry::{
     Classification, ExcludePattern, category_avg_tokens, classify_command, split_command_chain,
     strip_disabled_prefix_for_analytics,
@@ -327,6 +328,17 @@ struct UnsupportedBucket {
     example: String,
 }
 
+/// Session history source for `rtk discover --agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DiscoverAgent {
+    /// Claude Code JSONL transcripts
+    Claude,
+    /// OpenCode SQLite store
+    Opencode,
+    /// Every supported agent, merged into one report
+    All,
+}
+
 pub fn run(
     project: Option<&str>,
     all: bool,
@@ -334,8 +346,28 @@ pub fn run(
     limit: usize,
     format: &str,
     verbose: u8,
+    agent: Option<DiscoverAgent>,
 ) -> Result<()> {
-    let provider = ClaudeProvider;
+    // Providers to scan (design D3): an explicit `--agent` choice, or
+    // auto-detection of the providers whose storage exists.
+    let mut providers: Vec<Box<dyn SessionProvider>> = Vec::new();
+    match agent {
+        Some(DiscoverAgent::Claude) => providers.push(Box::new(ClaudeProvider)),
+        Some(DiscoverAgent::Opencode) => providers.push(Box::new(OpenCodeProvider::new())),
+        Some(DiscoverAgent::All) => {
+            providers.push(Box::new(ClaudeProvider));
+            providers.push(Box::new(OpenCodeProvider::new()));
+        }
+        None => {
+            if ClaudeProvider.available() {
+                providers.push(Box::new(ClaudeProvider));
+            }
+            let opencode = OpenCodeProvider::new();
+            if opencode.available() {
+                providers.push(Box::new(opencode));
+            }
+        }
+    }
 
     // Determine project filter. `scope` drives the report header (Claude-style
     // display); `filter` is raw filesystem scoping the provider translates
@@ -361,11 +393,25 @@ pub fn run(
         (false, None, None) => (report::ScanScope::AllProjects, provider::ProjectFilter::All),
     };
 
-    let sessions = provider.discover_sessions(filter, Some(since_days))?;
+    // Merge sessions from every selected provider, tagged with the provider
+    // index so extraction goes back through the provider that found them.
+    // A corrupt or locked store fails that provider open (design D4): warn,
+    // keep scanning the others.
+    let mut sessions: Vec<(usize, SessionRef)> = Vec::new();
+    for (i, p) in providers.iter().enumerate() {
+        match p.discover_sessions(filter, Some(since_days)) {
+            Ok(refs) => sessions.extend(refs.into_iter().map(|s| (i, s))),
+            Err(e) => eprintln!("rtk: warning: {e} — skipping this provider."),
+        }
+    }
+    let opencode_sessions = sessions
+        .iter()
+        .filter(|(_, s)| matches!(s, SessionRef::OpenCode { .. }))
+        .count();
 
     if verbose > 0 {
         eprintln!("Scanning {} session files...", sessions.len());
-        for s in &sessions {
+        for (_, s) in &sessions {
             eprintln!("  {}", s.display());
         }
     }
@@ -443,8 +489,9 @@ pub fn run(
     let mut supported_map: HashMap<&'static str, SupportedBucket> = HashMap::new();
     let mut unsupported_map: HashMap<String, UnsupportedBucket> = HashMap::new();
 
-    for session in &sessions {
-        let extracted = match provider.extract_commands(session) {
+    for (pi, session) in &sessions {
+        let opencode_session = matches!(session, SessionRef::OpenCode { .. });
+        let extracted = match providers[*pi].extract_commands(session) {
             Ok(cmds) => cmds,
             Err(e) => {
                 if verbose > 0 {
@@ -503,21 +550,27 @@ pub fn run(
                         estimated_savings_pct,
                         status,
                     } => {
-                        let coverage = hook_coverage(
-                            &ext_cmd.command,
-                            part,
-                            &ext_cmd.tool_use_id,
-                            &coverage_ctx,
-                        );
+                        // OpenCode calls never pass through rtk's hook, so neither
+                        // the measured log nor the current-state heuristic applies
+                        // to them; coverage is not measured for those sessions
+                        // (the report discloses this instead of guessing).
+                        if !opencode_session {
+                            let coverage = hook_coverage(
+                                &ext_cmd.command,
+                                part,
+                                &ext_cmd.tool_use_id,
+                                &coverage_ctx,
+                            );
 
-                        if coverage.is_covered() {
-                            // Hook already routed this through RTK at runtime — it's
-                            // coverage, not a missed opportunity.
-                            already_rtk += 1;
-                            if coverage.is_estimated() {
-                                already_rtk_estimated += 1;
+                            if coverage.is_covered() {
+                                // Hook already routed this through RTK at runtime — it's
+                                // coverage, not a missed opportunity.
+                                already_rtk += 1;
+                                if coverage.is_estimated() {
+                                    already_rtk_estimated += 1;
+                                }
+                                continue;
                             }
-                            continue;
                         }
 
                         let bucket = supported_map.entry(rtk_equivalent).or_insert_with(|| {
@@ -656,6 +709,7 @@ pub fn run(
 
     let report = DiscoverReport {
         sessions_scanned: sessions.len(),
+        opencode_sessions,
         scope,
         total_commands,
         already_rtk,

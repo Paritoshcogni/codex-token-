@@ -35,12 +35,7 @@ pub struct ExtractedCommand {
 #[derive(Debug, Clone)]
 pub enum SessionRef {
     File(PathBuf),
-    /// Constructed only by `OpenCodeProvider`, which the `--agent` task of
-    /// this change wires into `discover::run`; dead until then.
-    #[allow(dead_code)]
-    OpenCode {
-        session_id: String,
-    },
+    OpenCode { session_id: String },
 }
 
 impl SessionRef {
@@ -73,6 +68,9 @@ pub enum ProjectFilter<'a> {
 /// tool_use/tool_result blocks, so command extraction is not possible.
 /// Use `rtk gain` to track savings for Cursor sessions instead.
 pub trait SessionProvider {
+    /// Whether this provider's storage exists at all. Auto-detection offers
+    /// only providers that answer true; a never-installed agent stays silent.
+    fn available(&self) -> bool;
     fn discover_sessions(
         &self,
         filter: ProjectFilter<'_>,
@@ -216,6 +214,10 @@ impl ClaudeProvider {
 }
 
 impl SessionProvider for ClaudeProvider {
+    fn available(&self) -> bool {
+        Self::projects_dir().is_ok_and(|d| d.is_dir())
+    }
+
     fn discover_sessions(
         &self,
         filter: ProjectFilter<'_>,
