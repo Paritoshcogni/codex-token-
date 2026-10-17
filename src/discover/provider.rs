@@ -35,8 +35,8 @@ pub struct ExtractedCommand {
 #[derive(Debug, Clone)]
 pub enum SessionRef {
     File(PathBuf),
-    /// Constructed by the OpenCode provider (added in the next task group);
-    /// no constructor exists yet, hence the allow.
+    /// Constructed only by `OpenCodeProvider`, which the `--agent` task of
+    /// this change wires into `discover::run`; dead until then.
     #[allow(dead_code)]
     OpenCode {
         session_id: String,
