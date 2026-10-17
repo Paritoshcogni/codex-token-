@@ -82,6 +82,8 @@ pub trait SessionProvider {
 pub struct ClaudeProvider;
 
 /// Substring match of a project filter against a project directory name.
+/// The single definition of `--project` substring semantics, shared by every
+/// provider so one flag means the same thing across stores.
 ///
 /// On Windows the match is case-insensitive: NTFS paths are case-insensitive
 /// and Claude Code encodes the project folder from whatever cwd casing it was
@@ -90,7 +92,7 @@ pub struct ClaudeProvider;
 /// casing the launching shell set (an uppercase drive letter under PowerShell).
 /// Either side can differ from the other, so both are lowered; a case-sensitive
 /// match finds zero sessions.
-fn dir_matches_filter(dir_name: &str, filter: &str) -> bool {
+pub(crate) fn dir_matches_filter(dir_name: &str, filter: &str) -> bool {
     dir_matches_filter_impl(dir_name, filter, cfg!(windows))
 }
 

@@ -20,7 +20,9 @@
 //!
 //! Verified against OpenCode 1.19.0 (legacy tables) and 2.0.32 (v2 tables).
 
-use super::provider::{ExtractedCommand, ProjectFilter, SessionProvider, SessionRef};
+use super::provider::{
+    ExtractedCommand, ProjectFilter, SessionProvider, SessionRef, dir_matches_filter,
+};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
 use std::path::PathBuf;
@@ -147,20 +149,22 @@ impl SessionProvider for OpenCodeProvider {
             conditions.push("time_created >= ?".to_string());
             args.push(Box::new(now_millis() - (days as i64) * 86_400_000));
         }
-        match filter {
-            ProjectFilter::All => {}
+        // Substring scoping is filtered in Rust through the shared
+        // `dir_matches_filter` so `--project` means the same literal substring
+        // match on every provider (SQL LIKE would treat `%`/`_` in user input
+        // as wildcards and ignore case on all platforms).
+        let substring = match filter {
+            ProjectFilter::All => None,
             ProjectFilter::CurrentProject(dir) => {
                 // OpenCode records the plain working directory per session.
                 conditions.push("directory = ?".to_string());
                 args.push(Box::new(dir.to_string_lossy().into_owned()));
+                None
             }
-            ProjectFilter::Substring(s) => {
-                conditions.push("directory LIKE '%' || ? || '%'".to_string());
-                args.push(Box::new(s.to_string()));
-            }
-        }
+            ProjectFilter::Substring(s) => Some(s),
+        };
         let sql = format!(
-            "SELECT id FROM {table}{} ORDER BY time_created DESC, id",
+            "SELECT id, directory FROM {table}{} ORDER BY time_created DESC, id",
             if conditions.is_empty() {
                 String::new()
             } else {
@@ -170,17 +174,18 @@ impl SessionProvider for OpenCodeProvider {
         let mut stmt = conn.prepare_cached(&sql).context(
             "OpenCode provider unavailable: session query failed (corrupt or locked store)",
         )?;
-        let refs = stmt
+        let rows = stmt
             .query_map(
                 rusqlite::params_from_iter(args.iter().map(|p| p.as_ref())),
-                |row| {
-                    Ok(SessionRef::OpenCode {
-                        session_id: row.get(0)?,
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
             .context("OpenCode provider unavailable: session scan failed")?;
+        let refs = rows
+            .into_iter()
+            .filter(|(_, directory)| substring.is_none_or(|s| dir_matches_filter(directory, s)))
+            .map(|(session_id, _)| SessionRef::OpenCode { session_id })
+            .collect();
         Ok(refs)
     }
 
@@ -1033,5 +1038,27 @@ mod v2_tests {
             )
             .unwrap();
         assert_eq!(ids(&found), ["recent"]);
+    }
+
+    #[test]
+    fn substring_is_literal_not_sql_wildcard() {
+        // `--project` must be a literal substring on every provider: `_` and
+        // `%` in the filter match themselves, not LIKE wildcards.
+        let (f, conn) = seed_db_v2();
+        let now = now_millis();
+        insert_v2_session(&conn, "under", "/home/u/my_project", now);
+        insert_v2_session(&conn, "dash", "/home/u/my-project", now - 1000);
+        insert_v2_session(&conn, "pct", "/home/u/50x", now - 2000);
+
+        let provider = OpenCodeProvider::with_db_path(f.path().to_path_buf());
+        let found = provider
+            .discover_sessions(ProjectFilter::Substring("my_project"), None)
+            .unwrap();
+        assert_eq!(ids(&found), ["under"]);
+
+        let found = provider
+            .discover_sessions(ProjectFilter::Substring("50%"), None)
+            .unwrap();
+        assert!(found.is_empty());
     }
 }
