@@ -93,6 +93,81 @@ Unsupported or ambiguous wrapper syntax is left unchanged for the host to
 evaluate. Line continuations are joined before the check, as the rewrite joins
 them.
 
+Unambiguously-fish scripts (a fish-only keyword such as `end`, `begin`,
+`switch`, `and`, `or`, or `not` at command position, with no POSIX
+disambiguator anywhere, comments excluded before anything is classified) are
+rewritten to `rtk run --shell fish -c '<script>'` (`discover/fish_script.rs`),
+with the script's own commands rewritten inside the wrap so it costs no
+savings. Like wrapper rewrites, the wrapped form is never auto-allowed — its
+strongest verdict is `Ask`, for every host, including a delegate that owns
+approval (`ApprovalOwner`): the verdict behind a wrap says nothing about the
+script's own commands, because the segmenters read them as bash. The wrap is
+skipped without a resolvable `fish` binary, on Windows, or when
+`hooks.wrap_fish_scripts = false`; those cases take the decision path they
+always did.
+
+**It is offered only on `rtk hook claude`** (`DenyRules` and
+`claude_hook_deny_rules` in `permissions.rs`), and only when every Claude Code
+settings file RTK reads parsed and none of them has a deny rule. Once the
+script reaches a fish, RTK's own view of it stops describing what runs: fish
+starts a command where the bash-shaped segmenter does not look — the condition
+of an `if` or a `while`, the right side of `and`/`or`/`not` — and resolves
+words at run time, through variables, globs, aliases, functions and escapes
+whose expansion differs between fish versions. The wrap also puts *every*
+command of the script inside one quoted argument, which is what separates it
+from an ordinary rewrite: a host's own rule on a command RTK never rewrites
+still fires today, and would not fire on the wrapped form. So the wrap needs a
+host that enforces exactly the rules RTK reads, and Claude Code's hook is the
+only one:
+
+- Gemini's loader reads `tools.allowed` and `tools.confirmationRequired` only
+  and never yields a deny rule, so its exclude lists are invisible here;
+- Droid's built-in defaults are deliberately not mirrored, so an empty
+  `commandDenylist` says nothing about what Droid refuses;
+- Cursor's loader reads the global `cli-config.json`, while the host also
+  applies the project's;
+- Copilot resolves to `Host::Claude` for its verdict but judges the returned
+  command with its own allowlist flow, so it is `AgentPath::InProcess`, not
+  `AgentPath::ClaudeHook`;
+- OpenCode re-evaluates its own patterns against the string RTK returns, with
+  the rule set resolved per agent at run time;
+- Codex, Trae, Vibe and Antigravity have no RTK-side rule source at all;
+- `rtk rewrite` reads Claude's rules, but the delegates that shell out to it
+  apply exit 3 without prompting (`hooks/pi/rtk.ts`,
+  `hooks/hermes/rtk-rewrite`) and OpenClaw matches its own exec checks against
+  the returned string;
+- a rules-file install (`AgentPath::RulesOnly`) has no hook at all, so
+  `rtk hook check` must not show it a wrap nothing would ever emit.
+
+The cost is deliberate and belongs in the user docs: a user with any deny rule
+keeps the behaviour they had before the wrap existed.
+
+**Why it runs before the unattestable gate.** Every other rewrite refuses a
+command the gate could not decompose. The wrap cannot wait for that gate and
+still do its job: a host that evaluates the command string with a POSIX layer
+fails to parse a fish script *before* RTK is consulted at all, so deferring
+means the command is lost rather than merely unrewritten. What it does instead
+is refuse everything that gate refuses — command and process substitution,
+file-target redirects, and fish's own `(cmd)` substitution, which the shared
+bash lexer reads as a subshell — reading the same comment-stripped text the
+classification uses, so a quote in a comment cannot blind it. It also refuses
+fish's `&|` pipe, which that lexer reads as a background `&` plus a pipe and
+the rewrite re-emits spaced, a form fish rejects outright. The only scripts
+that reach the wrap are ones whose sole unattestable property is fish control
+flow (`; and`, `if … end`), which the shared segmenter cannot split into
+commands. For those:
+
+- the script travels inside one quoted argument and RTK decides nothing about
+  its contents beyond the rewrite rules it applies to them — those rules are
+  the one edit it makes, so the argument carries the same commands rather than
+  the same bytes;
+- the verdict is `Ask`, never `Allow` and never relaxed;
+- the residual exposure is a host that treats an `rtk`-prefixed command as
+  pre-approved. Codex does, but Codex never wraps — what remains is a Claude
+  Code user with no deny rule who adds one later: the wrap stops being offered
+  from that point on. `hooks.wrap_fish_scripts = false` is
+  the switch for a host where the trade is not wanted.
+
 | Verdict | Trigger | rewrite_cmd exit | Hook behavior |
 |---------|---------|-----------------|---------------|
 | Deny | `permissions.deny` rule matched | 2 | Passthrough — host tool handles denial |

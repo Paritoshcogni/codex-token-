@@ -238,16 +238,44 @@ fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
 /// the recall bookkeeping the hook path performs for any command it does not
 /// deny. `cwd` is the payload's working directory when the host reports one
 /// (only the Claude Code hook does; see #3864).
-fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict, cwd: Option<&str>) -> HookDecision {
+///
+/// `deny_rules` says whether RTK can show that nothing in a wrapped script
+/// could escape a deny rule. Only Claude Code's own hook can
+/// ([`decide_claude_hook_action`]); every other caller passes
+/// [`permissions::DenyRules::Unattested`] and therefore never wraps.
+fn decide_from_verdict(
+    cmd: &str,
+    verdict: PermissionVerdict,
+    deny_rules: permissions::DenyRules,
+    cwd: Option<&str>,
+) -> HookDecision {
     if verdict == PermissionVerdict::Deny {
         return HookDecision::Deny;
     }
     crate::hooks::rewrite_cmd::track_tee_read(cmd);
-    decision::decide_for_agent_at(cmd, verdict, cwd)
+    decision::decide_for_agent_at(cmd, verdict, deny_rules, cwd)
 }
 
 fn decide_hook_action(cmd: &str, host: permissions::Host, cwd: Option<&str>) -> HookDecision {
-    decide_from_verdict(cmd, permissions::check_command_for(cmd, host), cwd)
+    decide_from_verdict(
+        cmd,
+        permissions::check_command_for(cmd, host),
+        permissions::DenyRules::Unattested,
+        cwd,
+    )
+}
+
+/// [`decide_hook_action`] for Claude Code's own hook, the one host that
+/// enforces exactly the rules RTK reads. Copilot shares `Host::Claude` for its
+/// verdict but judges the returned command itself, so it keeps
+/// [`decide_hook_action`].
+fn decide_claude_hook_action(cmd: &str, cwd: Option<&str>) -> HookDecision {
+    decide_from_verdict(
+        cmd,
+        permissions::check_command_for(cmd, permissions::Host::Claude),
+        permissions::claude_hook_deny_rules(),
+        cwd,
+    )
 }
 
 fn handle_vscode(cmd: &str, input: &Value) -> Result<()> {
@@ -409,6 +437,7 @@ fn run_gemini_inner_with_rules(
         decide_from_verdict(
             cmd,
             permissions::check_command_with_rules(cmd, deny, ask, allow),
+            permissions::DenyRules::Unattested,
             None,
         )
     })
@@ -682,11 +711,7 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     };
 
     let cwd = v.get("cwd").and_then(Value::as_str);
-    process_claude_payload_from_decision(
-        v,
-        cmd,
-        decide_hook_action(cmd, permissions::Host::Claude, cwd),
-    )
+    process_claude_payload_from_decision(v, cmd, decide_claude_hook_action(cmd, cwd))
 }
 
 /// Pure core of `process_claude_payload`, taking the hook decision directly so the
@@ -1165,7 +1190,7 @@ fn run_cursor_inner_with_rules(
     };
 
     let verdict = permissions::check_command_with_rules(&cmd, deny_rules, ask_rules, allow_rules);
-    match decide_from_verdict(&cmd, verdict, None) {
+    match decide_from_verdict(&cmd, verdict, permissions::DenyRules::Unattested, None) {
         HookDecision::AllowRewrite(rewritten) => cursor_allow(&rewritten),
         HookDecision::AskRewrite(rewritten) => cursor_ask(&rewritten),
         _ => "{}".to_string(),
@@ -1263,7 +1288,11 @@ fn opencode_answer(cmd: &str, rules: &[permissions_opencode::Rule]) -> Value {
         return json!({});
     }
     let before = permissions_opencode::check_command_with_opencode_rules(cmd, rules);
-    let rewritten = match decide_from_verdict(cmd, before, None) {
+    // OpenCode re-evaluates its own patterns against whatever RTK returns, so
+    // the rule set read here is advisory rather than enforced — hence
+    // `Unattested`, and no fish script is wrapped for this host.
+    let rewritten = match decide_from_verdict(cmd, before, permissions::DenyRules::Unattested, None)
+    {
         // OpenCode denies the typed command itself; a rewrite could only
         // un-match the deny rule.
         HookDecision::Deny => {
@@ -1332,8 +1361,12 @@ fn run_droid_inner_with_rules(
     let v: Value = droid_payload(input).ok().flatten()?;
     let cmd = droid_execute_command(&v)?;
     let verdict = permissions::check_command_with_rules(cmd, deny_rules, ask_rules, allow_rules);
-    droid_response_from_decision(&v, cmd, decide_from_verdict(cmd, verdict, None))
-        .map(|o| o.to_string())
+    droid_response_from_decision(
+        &v,
+        cmd,
+        decide_from_verdict(cmd, verdict, permissions::DenyRules::Unattested, None),
+    )
+    .map(|o| o.to_string())
 }
 
 #[cfg(test)]
@@ -1721,7 +1754,7 @@ mod tests {
         );
         copilot_cli_response_from_decision(
             &cli_args(cmd),
-            decide_from_verdict(cmd, verdict, None),
+            decide_from_verdict(cmd, verdict, permissions::DenyRules::NoneConfigured, None),
             cmd,
         )
     }
@@ -2296,8 +2329,13 @@ mod tests {
             (PermissionVerdict::Ask, HookOutcome::Ask),
             (PermissionVerdict::Allow, HookOutcome::Allow),
         ] {
-            let decision =
-                super::super::decision::decide_with_params("git status", verdict, &[], &[]);
+            let decision = super::super::decision::decide_with_params(
+                "git status",
+                verdict,
+                &[],
+                &[],
+                permissions::DenyRules::NoneConfigured,
+            );
             let PayloadAction::Rewrite {
                 output, decision, ..
             } = process_codex_payload_from_decision(&input, "git status", decision)
@@ -2320,6 +2358,7 @@ mod tests {
             PermissionVerdict::Deny,
             &[],
             &[],
+            permissions::DenyRules::NoneConfigured,
         );
         assert!(matches!(
             process_codex_payload_from_decision(&input, "git status", denied),
@@ -2878,7 +2917,7 @@ mod tests {
         allow: &[String],
     ) -> HookDecision {
         let verdict = permissions::check_command_with_rules(cmd, deny, ask, allow);
-        decide_from_verdict(cmd, verdict, None)
+        decide_from_verdict(cmd, verdict, permissions::DenyRules::Unattested, None)
     }
 
     fn all_allowed() -> Vec<String> {
@@ -3449,7 +3488,12 @@ mod tests {
         let verdict = permissions::check_command_with_rules(command, &[], &[], &["*".to_string()]);
         let response = copilot_cli_response_from_decision(
             &cli_args(command),
-            decide_from_verdict(command, verdict, None),
+            decide_from_verdict(
+                command,
+                verdict,
+                permissions::DenyRules::NoneConfigured,
+                None,
+            ),
             command,
         )
         .expect("wrapper rewrite expected");

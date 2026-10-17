@@ -1339,6 +1339,51 @@ Before comparing, RTK strips the wrapper, interpreter or path, so `"playwright"`
 `python3 -m pytest tests/`. Arguments are kept: `"^ls$"` excludes bare `ls` without
 also matching `ls -la`.
 
+### Unambiguously-fish scripts
+
+Some hosts evaluate the command string with a POSIX-compatible layer even when
+the user's shell is fish: a multi-line fish script (`if ... end`, `; and`,
+`; or`) then fails to parse before RTK even starts. The hook detects
+**unambiguous** scripts (a fish-only keyword such as `end`, `begin`, `switch`,
+`and`, `or`, `not` at command position, with no POSIX `then`/`fi`/`do`/`done`
+marker) and hands them back for explicit fish execution:
+
+```
+if test -d src\n  git status\nend
+-> rtk run --shell fish -c 'if test -d src\n  git status\nend'
+
+git diff HEAD~3 HEAD; and true
+-> rtk run --shell fish -c 'rtk git diff HEAD~3 HEAD; and true'
+```
+
+Key points:
+
+- The script's own commands go through the ordinary rewrite rules first, so
+  wrapping costs no savings. A *multi-line* block opened by
+  `if`/`for`/`while`/`switch` is carried through unrewritten, as the rewrite
+  rules leave such blocks alone; a single-line `if ...; ...; end` is rewritten
+  like any other chain.
+- The rewrite is always an "ask" — never auto-allowed by RTK, for any host,
+  including delegates that own their own approval — because the script's
+  content cannot be attested.
+- **It happens only on `rtk hook claude`, and only when every Claude Code
+  settings file RTK reads parsed and none of them has a `deny` rule.** Once a
+  script reaches a fish, RTK can no longer say which commands run: fish starts
+  one where bash has no grammar at all, and resolves words at run time. The
+  wrap also puts *every* command of the script inside one quoted argument,
+  where a host's own rule can no longer see it — so it is offered only for the
+  host that enforces exactly the rules RTK reads. Every other host, every
+  rules-only agent and `rtk rewrite` keep the behaviour they had without this
+  feature. **If you use `deny` rules at all, so do your fish scripts.**
+- Requires a resolvable `fish` binary; disabled on Windows.
+- Also left alone — and so following the usual path, rewrite rules included:
+  ambiguous or POSIX scripts; those RTK cannot decompose for the permission
+  check (command substitution, including fish's own `(cmd)`, and a redirect to
+  a file — so `for f in (ls) ... end`); those containing `\\` or `\'` (fish and
+  POSIX single quotes disagree); and fish's `&|` pipe, which the rewrite cannot
+  re-emit in a form fish accepts.
+- Turn it off with `wrap_fish_scripts = false` under `[hooks]`.
+
 ---
 
 ## Configuration
@@ -1385,6 +1430,7 @@ enabled = false             # Anonymous telemetry (1 ping/day, requires consent)
 
 [hooks]
 exclude_commands = []       # Commands excluded from automatic rewriting
+wrap_fish_scripts = true    # Hand an unambiguously-fish script back as `rtk run --shell fish -c`
 ```
 
 ### Environment variables
