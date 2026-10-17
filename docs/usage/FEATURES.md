@@ -1339,33 +1339,50 @@ Before comparing, RTK strips the wrapper, interpreter or path, so `"playwright"`
 `python3 -m pytest tests/`. Arguments are kept: `"^ls$"` excludes bare `ls` without
 also matching `ls -la`.
 
-### Scripts fish non ambigus
+### Unambiguously-fish scripts
 
-Certains hotes evaluent la chaine de commande avec une couche compatible POSIX
-meme quand le shell de l'utilisateur est fish : un script fish multi-lignes
-(`if ... end`, `; and`, `; or`) echoue alors en erreur de parsing avant meme
-que RTK demarre. Le hook detecte les scripts **non ambigus** (mot-cle
-exclusivement fish comme `end`, `begin`, `switch`, `and`, `or`, `not` en
-position de commande, sans marqueur POSIX `then`/`fi`/`do`/`done`) et les
-reecrit en execution fish explicite :
+Some hosts evaluate the command string with a POSIX-compatible layer even when
+the user's shell is fish: a multi-line fish script (`if ... end`, `; and`,
+`; or`) then fails to parse before RTK even starts. The hook detects
+**unambiguous** scripts (a fish-only keyword such as `end`, `begin`, `switch`,
+`and`, `or`, `not` at command position, with no POSIX `then`/`fi`/`do`/`done`
+marker) and hands them back for explicit fish execution:
 
 ```
 if test -d src\n  git status\nend
--> rtk run --shell fish -c 'if test -d src\n  rtk git status\nend'
+-> rtk run --shell fish -c 'if test -d src\n  git status\nend'
+
+git diff HEAD~3 HEAD; and true
+-> rtk run --shell fish -c 'rtk git diff HEAD~3 HEAD; and true'
 ```
 
-Points cles :
-- Les commandes du script passent d'abord par les regles de reecriture
-  habituelles : l'encapsulation ne coute aucune economie.
-- La reecriture est toujours en mode « ask » (jamais auto-approuvee) : le
-  contenu du script n'est pas attestable.
-- Necessite un binaire `fish` resolvable ; desactive sous Windows.
-- Les scripts ambigus ou POSIX passent inchanges, comme avant.
-- Passent aussi inchanges les scripts que RTK ne peut pas decomposer pour la
-  verification des permissions : substitution de commande (y compris la forme
-  fish `(cmd)`) et redirection vers un fichier — donc `for f in (ls) ... end`
-  n'est pas encapsule.
-- Desactivable via `wrap_fish_scripts = false` dans la section `[hooks]`.
+Key points:
+
+- The script's own commands go through the ordinary rewrite rules first, so
+  wrapping costs no savings. A *multi-line* block opened by
+  `if`/`for`/`while`/`switch` is carried through unrewritten, as the rewrite
+  rules leave such blocks alone; a single-line `if ...; ...; end` is rewritten
+  like any other chain.
+- The rewrite is always an "ask" — never auto-allowed by RTK, for any host,
+  including delegates that own their own approval — because the script's
+  content cannot be attested.
+- **It happens only on `rtk hook claude`, and only when every Claude Code
+  settings file RTK reads parsed and none of them has a `deny` rule.** Once a
+  script reaches a fish, RTK can no longer say which commands run: fish starts
+  one where bash has no grammar at all, and resolves words at run time. The
+  wrap also puts *every* command of the script inside one quoted argument,
+  where a host's own rule can no longer see it — so it is offered only for the
+  host that enforces exactly the rules RTK reads. Every other host, every
+  rules-only agent and `rtk rewrite` keep the behaviour they had without this
+  feature. **If you use `deny` rules at all, so do your fish scripts.**
+- Requires a resolvable `fish` binary; disabled on Windows.
+- Also left alone — and so following the usual path, rewrite rules included:
+  ambiguous or POSIX scripts; those RTK cannot decompose for the permission
+  check (command substitution, including fish's own `(cmd)`, and a redirect to
+  a file — so `for f in (ls) ... end`); those containing `\\` or `\'` (fish and
+  POSIX single quotes disagree); and fish's `&|` pipe, which the rewrite cannot
+  re-emit in a form fish accepts.
+- Turn it off with `wrap_fish_scripts = false` under `[hooks]`.
 
 ---
 

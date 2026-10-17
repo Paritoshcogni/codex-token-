@@ -28,9 +28,13 @@ const POSIX_ONLY_KEYWORDS: &[&str] = &["then", "fi", "do", "done", "esac", "elif
 ///
 /// Returns `None` (caller keeps its defer behavior) when the script is not
 /// provably fish, when the command already delegates (`rtk …` or an explicit
-/// shell `-c` wrapper), when the script contains a fish-divergent backslash
-/// sequence (`\\` or `\'`), on Windows, when `hooks.wrap_fish_scripts` is
-/// disabled, or when no `fish` binary is resolvable.
+/// shell `-c` wrapper), when the comment scan refuses because the two shells
+/// disagree where a comment starts, when the permission gate could not
+/// decompose the script (substitution, a file-target redirect) or it carries
+/// fish's own `(cmd)` substitution or `&|` pipe, when the script contains a
+/// fish-divergent backslash sequence (`\\` or `\'`), on Windows, when
+/// `hooks.wrap_fish_scripts` is disabled, or when no `fish` binary is
+/// resolvable.
 ///
 /// The cheap, pure classification runs first; the config read and the `fish`
 /// PATH probe run only once the command is classified fish. So common non-fish
@@ -39,11 +43,7 @@ const POSIX_ONLY_KEYWORDS: &[&str] = &["then", "fi", "do", "done", "esac", "elif
 pub fn try_wrap(cmd: &str) -> Option<String> {
     try_wrap_with_probes(
         cmd,
-        || {
-            crate::core::config::Config::load()
-                .map(|c| c.hooks.wrap_fish_scripts)
-                .unwrap_or(true)
-        },
+        || crate::core::config::cached_config().hooks.wrap_fish_scripts,
         || crate::core::utils::resolve_binary("fish").is_ok(),
     )
 }
@@ -94,6 +94,16 @@ fn try_wrap_with_probes(
     if lexer::contains_unattestable_construct(&code) || contains_fish_substitution(&code) {
         return None;
     }
+    // `&|` pipes stdout and stderr in fish, and `&` opens the same kind of
+    // pair in zsh. The shared lexer reads each as a background `&` followed by
+    // a pipe or a negation, so the inner rewrite re-emits the two spaced —
+    // `rtk git status & | cat` — which fish rejects outright. The wrap
+    // promises the argument carries the same commands, so a script RTK cannot
+    // rewrite without changing what it runs is left alone, exactly as the
+    // `fish -c` wrapper path leaves it.
+    if lexer::opens_disown_pair(&code) {
+        return None;
+    }
     // Fish single-quoted strings diverge from POSIX single-quote semantics for
     // exactly two sequences: `\\` collapses to one backslash and `\'` becomes a
     // literal quote (a backslash before any other character is literal in both).
@@ -120,18 +130,6 @@ pub(crate) fn wrap(script: &str) -> String {
         "rtk run --shell fish -c '{}'",
         escape_single_quoted(script.trim())
     )
-}
-
-/// The script's words, dequoted, read from the same comment-stripped code the
-/// classification and the gates read.
-///
-/// `None` when the comment scan refuses, i.e. when the two shells disagree
-/// about where a comment starts. Callers that answer a security question about
-/// the script — "could a deny rule match anything in here" — must read these
-/// words rather than the raw text: an apostrophe in a comment opens the shared
-/// lexer's quote state and swallows everything after it into one argument.
-pub(crate) fn code_words(cmd: &str) -> Option<Vec<String>> {
-    Some(lexer::shell_split(&strip_comments(cmd)?))
 }
 
 /// True for fish's `(cmd)` command substitution, which the shared lexer reads
@@ -595,6 +593,25 @@ mod tests {
     fn test_backslash_quote_script_is_not_wrapped() {
         // Contains `\'`, which fish single-quotes turn into a literal quote.
         assert!(try_wrap_gated("echo \\'; and echo ok", true).is_none());
+    }
+
+    /// `&|` is fish's stdout-and-stderr pipe. The shared lexer reads it as a
+    /// background `&` plus a pipe and the rewrite re-emits the two spaced,
+    /// which fish rejects — so a wrap would hand back a script fish cannot
+    /// parse. The `fish -c` wrapper path refuses the same shape.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_fish_stderr_pipe_is_not_wrapped() {
+        for cmd in [
+            "git status &| cat; and true",
+            "git log -5 &| head -3; and true",
+            "begin\n  git status &| cat\nend",
+        ] {
+            assert!(try_wrap_gated(cmd, true).is_none(), "{cmd:?}");
+        }
+        // A background `&` followed by a *separate* pipeline still wraps: the
+        // two are only the fish pipe when they are adjacent.
+        assert!(try_wrap_gated("sleep 1 & git status | cat; and true", true).is_some());
     }
 
     #[test]

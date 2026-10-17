@@ -8342,6 +8342,7 @@ mod tests {
             "pest"
         );
     }
+
     /// `jj` is covered only by a TOML filter, never by the native RULES table,
     /// so the bare case pins the TOML branch of the rewrite path and keeps the
     /// wrapper assertions below from passing vacuously when TOML is disabled.

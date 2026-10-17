@@ -107,6 +107,17 @@ fish -c 'git status; and cargo test'  # unchanged
 
 Shell expansion inside an outer double quote, extra shell options, redirects to files and nested wrappers pass through unchanged.
 
+A command string that is *itself* fish — a multi-line `if`/`for`/`switch` … `end` block, or a `; and` / `; or` chain — is handed back for explicit fish execution instead, because a host evaluating it with a POSIX layer would fail to parse it before RTK ever runs:
+
+```fish
+if test -d src
+  git status
+end
+# → rtk run --shell fish -c 'if test -d src\n  git status\nend'
+```
+
+This happens on Claude Code's hook only, and only when every settings file RTK reads parsed and none of them has a `deny` rule. Once the script reaches a fish, RTK can no longer say which commands run — fish starts one where bash has no grammar at all, and resolves words at run time — and the wrap puts every command of the script inside one quoted argument, where a host's own rule can no longer see it. **So if you use `deny` rules at all, your fish scripts keep the behaviour they had without this feature**, as they do on every other host and through `rtk rewrite`. It also needs a resolvable `fish` binary, is disabled on Windows, and `wrap_fish_scripts = false` under `[hooks]` turns it off.
+
 ## Step 4: Unsupported commands
 
 Commands RTK doesn't recognize run through passthrough — output is unchanged, usage is tracked:
