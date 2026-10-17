@@ -440,6 +440,41 @@ FAILED tests/test_foo.py::test_three - KeyError
     }
 
     #[test]
+    fn test_filter_pytest_passes_section_not_listed_as_failures() {
+        let output = r#"=== test session starts ===
+collected 2 items
+
+test_sample.py .F                                                        [100%]
+
+=================================== FAILURES ===================================
+__________________________________ test_fail ___________________________________
+test_sample.py:6: in test_fail
+    assert False
+E   AssertionError: assert False
+==================================== PASSES ====================================
+__________________________________ test_pass ___________________________________
+----------------------------- Captured stdout call -----------------------------
+hello from passing test
+error-like output in passing test stdout
+=========================== short test summary info ============================
+PASSED test_sample.py::test_pass
+FAILED test_sample.py::test_fail - AssertionError: assert False
+========================= 1 failed, 1 passed in 0.02s =========================="#;
+
+        let result = filter_pytest_output(output);
+        assert!(result.starts_with("Pytest: 1 passed, 1 failed in 0.02s"));
+        assert!(result.contains("[FAIL] test_fail"));
+        assert!(
+            !result.contains("test_pass"),
+            "passing test from PASSES section must not be listed as failure: {result}"
+        );
+        assert!(
+            !result.contains("error-like output in passing test stdout"),
+            "captured stdout from PASSES section must not leak into failures: {result}"
+        );
+    }
+
+    #[test]
     fn test_filter_pytest_no_tests() {
         let output = r#"=== test session starts ===
 collected 0 items
