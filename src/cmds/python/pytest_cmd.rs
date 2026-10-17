@@ -154,6 +154,12 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
                         current_failure.clear();
                     }
                     current_failure.push(trimmed.to_string());
+                } else if trimmed.starts_with("===") && trimmed.ends_with("===") {
+                    if !current_failure.is_empty() {
+                        failures.push(current_failure.join("\n"));
+                        current_failure.clear();
+                    }
+                    state = ParseState::TestProgress;
                 } else if !trimmed.is_empty() && !trimmed.starts_with("===") {
                     current_failure.push(trimmed.to_string());
                 }
