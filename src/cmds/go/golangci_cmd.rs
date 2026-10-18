@@ -4,7 +4,8 @@ use crate::core::arg_tokenizer::{self, Dialect, TokenKind, ValueSpec};
 use crate::core::args_utils;
 use crate::core::config;
 use crate::core::runner;
-use crate::core::stream::exec_capture;
+use crate::core::shell::display_args;
+use crate::core::stream::exec_capture_unguarded;
 use crate::core::truncate::CAP_WARNINGS;
 use crate::core::utils::{resolved_command, truncate};
 use anyhow::Result;
@@ -162,10 +163,13 @@ pub(crate) fn parse_major_version(version_output: &str) -> u32 {
     // would send it `--out-format=json`, a flag v2 removed.
     for word in version_output.split_whitespace() {
         let version = word.strip_prefix('v').unwrap_or(word);
-        if let Some(major) = version.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
-            if version.contains('.') {
-                return major;
-            }
+        if let Some(major) = version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            && version.contains('.')
+        {
+            return major;
         }
     }
     1
@@ -177,7 +181,7 @@ pub(crate) fn detect_major_version() -> u32 {
     let mut cmd = resolved_command("golangci-lint");
     cmd.arg("--version");
 
-    match exec_capture(&mut cmd) {
+    match exec_capture_unguarded(&mut cmd) {
         Ok(r) => {
             let version_text = if r.stdout.trim().is_empty() {
                 &r.stderr
@@ -217,7 +221,7 @@ fn run_filtered(original_args: &[String], invocation: &RunInvocation, verbose: u
     let exit_code = runner::run_filtered(
         cmd,
         "golangci-lint",
-        &original_args.join(" "),
+        &display_args(original_args),
         |stdout| {
             // v2 outputs JSON on first line + trailing text; v1 outputs just JSON
             let json_output = if version >= 2 {
@@ -420,17 +424,16 @@ pub(crate) fn filter_golangci_json(output: &str, version: u32) -> String {
             result.push_str(&format!("    {} ({})\n", linter, linter_issues.len()));
 
             // v2 only: show first source line for this linter-file group
-            if version >= 2 {
-                if let Some(first_issue) = linter_issues.first() {
-                    if let Some(source_line) = first_issue.source_lines.first() {
-                        let trimmed = source_line.trim();
-                        let display = match trimmed.char_indices().nth(80) {
-                            Some((i, _)) => &trimmed[..i],
-                            None => trimmed,
-                        };
-                        result.push_str(&format!("      → {}\n", display));
-                    }
-                }
+            if version >= 2
+                && let Some(first_issue) = linter_issues.first()
+                && let Some(source_line) = first_issue.source_lines.first()
+            {
+                let trimmed = source_line.trim();
+                let display = match trimmed.char_indices().nth(80) {
+                    Some((i, _)) => &trimmed[..i],
+                    None => trimmed,
+                };
+                result.push_str(&format!("      → {}\n", display));
             }
         }
     }
@@ -531,7 +534,9 @@ mod tests {
     #[test]
     fn test_parse_version_v2_format() {
         assert_eq!(
-            parse_major_version("golangci-lint has version 2.10.0 built with go1.26.0 from 95dcb68a on 2026-02-17T13:05:51Z"),
+            parse_major_version(
+                "golangci-lint has version 2.10.0 built with go1.26.0 from 95dcb68a on 2026-02-17T13:05:51Z"
+            ),
             2
         );
     }
@@ -607,12 +612,7 @@ mod tests {
         // -c takes a separate-token value; its value ("foo.yml") must not be mistaken for
         // the subcommand.
         assert_eq!(
-            classify_invocation(&[
-                "-c".into(),
-                "foo.yml".into(),
-                "run".into(),
-                "./...".into(),
-            ]),
+            classify_invocation(&["-c".into(), "foo.yml".into(), "run".into(), "./...".into(),]),
             Invocation::FilteredRun(RunInvocation {
                 global_args: vec!["-c".into(), "foo.yml".into()],
                 run_args: vec!["./...".into()],
@@ -759,7 +759,10 @@ mod tests {
             "--disable".to_string(),
             "errcheck".to_string(),
         ]));
-        assert!(!has_output_flag(&["--timeout".to_string(), "30s".to_string()]));
+        assert!(!has_output_flag(&[
+            "--timeout".to_string(),
+            "30s".to_string()
+        ]));
     }
 
     #[test]
@@ -771,7 +774,10 @@ mod tests {
         assert_eq!(find_subcommand_index(&args), Some(1));
 
         // Solo, it still takes its value -- that spelling golangci-lint does accept.
-        let args: Vec<String> = ["-c", "cfg.yml", "run"].iter().map(|a| a.to_string()).collect();
+        let args: Vec<String> = ["-c", "cfg.yml", "run"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
         assert_eq!(find_subcommand_index(&args), Some(2));
 
         // And the attached spelling is untouched by the solo-only rule.
@@ -785,7 +791,10 @@ mod tests {
         // unlinked Positional.
         let args = vec!["--out-format".to_string(), "json".to_string()];
         let tokens = arg_tokenizer::tokenize_grammar(&args, &run_takes_value, Dialect::Posix);
-        assert!(tokens[0].linked.is_some(), "\"json\" must link to --out-format");
+        assert!(
+            tokens[0].linked.is_some(),
+            "\"json\" must link to --out-format"
+        );
     }
 
     #[test]
@@ -958,7 +967,11 @@ mod tests {
         let filtered_tokens = estimate_tokens(&filtered) as f64;
         let savings = 100.0 - (filtered_tokens / raw_tokens * 100.0);
 
-        assert!(savings >= 60.0, "expected >=60% savings, got {:.1}%", savings);
+        assert!(
+            savings >= 60.0,
+            "expected >=60% savings, got {:.1}%",
+            savings
+        );
     }
 
     /// The filter always has something to say about its input. Whether that is worth
