@@ -1565,14 +1565,14 @@ Restore failed with 1 error(s) in 1.0s
 
         // String records (index starts at 10)
         for s in [
-            "Csc",                                             // 10
-            "CS0168",                                          // 11
+            "Csc",                                              // 10
+            "CS0168",                                           // 11
             "The variable 'unused' is declared but never used", // 12
-            "Beta.cs",                                         // 13
-            "/tmp/App/App.csproj",                             // 14
-            "CS0103",                                          // 15
-            "The name 'missing' does not exist",               // 16
-            "Alpha.cs",                                        // 17
+            "Beta.cs",                                          // 13
+            "/tmp/App/App.csproj",                              // 14
+            "CS0103",                                           // 15
+            "The name 'missing' does not exist",                // 16
+            "Alpha.cs",                                         // 17
         ] {
             write_7bit_i32(&mut records, RECORD_STRING);
             write_dotnet_string(&mut records, s);
