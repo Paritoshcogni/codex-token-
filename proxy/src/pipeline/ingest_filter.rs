@@ -45,8 +45,8 @@
 //! result is elsewhere in the history — shortening the echoed argument body does
 //! not change any future behaviour.
 //!
-//! Only Anthropic requests are touched; system, tools, and plain text are left
-//! untouched. Off by default.
+//! Only Anthropic and OpenAI (Chat Completions) requests are touched; system,
+//! tools, and plain text are left untouched. Off by default.
 
 use crate::error::AppResult;
 use crate::model::{InterceptedRequest, Provider};
@@ -222,7 +222,7 @@ enum Mode {
 }
 
 /// Shared state while walking the request's text payloads in order.
-struct Filter {
+pub(crate) struct Filter {
     mode: Mode,
     /// Maps each dedup *identifier* (the marker we would emit for a block) to the
     /// full-content hash of the FIRST earlier block that produced it. Backward-
@@ -379,7 +379,7 @@ impl Filter {
 /// Build a compact `Tool(arg)` origin label from a `tool_result`'s originating
 /// call, if it can be resolved from the `tool_use_id` → call map. Returns e.g.
 /// `Read(/src/main.rs)` or just `Bash` when no salient argument is available.
-fn origin_label(call: Option<&(String, Option<String>)>) -> Option<String> {
+pub(crate) fn origin_label(call: Option<&(String, Option<String>)>) -> Option<String> {
     let (name, arg) = call?;
     match arg {
         Some(a) if !a.is_empty() => Some(format!("{name}({a})")),
@@ -389,11 +389,17 @@ fn origin_label(call: Option<&(String, Option<String>)>) -> Option<String> {
 
 /// Map of `tool_use_id` → (tool name, key argument), collected from `tool_use`
 /// blocks so a `tool_result` can name its originating call in the dedup marker.
-type CallMap = HashMap<String, (String, Option<String>)>;
+pub(crate) type CallMap = HashMap<String, (String, Option<String>)>;
 
-/// Rewrite the `content` of a single `tool_result` block in place. `origin` is a
+/// Rewrite the `content` of a single tool-result-shaped object in place — an
+/// Anthropic `tool_result` block or an OpenAI `role: "tool"` message (both
+/// carry tool output in `content`, string or text-parts). `origin` is a
 /// readable `Tool(arg)` label for the originating call, if known.
-fn filter_tool_result_block(block: &mut serde_json::Value, f: &mut Filter, origin: Option<&str>) {
+pub(crate) fn filter_tool_result_block(
+    block: &mut serde_json::Value,
+    f: &mut Filter,
+    origin: Option<&str>,
+) {
     match block.get_mut("content") {
         // String content form: { type: tool_result, content: "..." }
         Some(serde_json::Value::String(s)) => {
@@ -439,7 +445,7 @@ fn filter_tool_use_block(block: &mut serde_json::Value, f: &mut Filter) {
 /// Extract a salient argument from a `tool_use` input object for the origin
 /// label (e.g. `file_path`, `path`, `command`, or `pattern`). Best-effort and
 /// purely cosmetic — only used to make the dedup marker more readable.
-fn salient_arg(input: &serde_json::Value) -> Option<String> {
+pub(crate) fn salient_arg(input: &serde_json::Value) -> Option<String> {
     let obj = input.as_object()?;
     for key in [
         "file_path",
@@ -672,10 +678,20 @@ impl Transform for IngestFilterTransform {
     }
 
     async fn on_request(&self, req: &mut InterceptedRequest) -> AppResult<()> {
-        // Anthropic only; tool_result is an Anthropic Messages construct.
-        if req.provider != Provider::Anthropic {
-            return Ok(());
-        }
+        // Dialect selection: the per-message walk shape differs (Anthropic
+        // content blocks vs OpenAI `role: "tool"` messages), the Filter
+        // machinery is shared verbatim. See ingest_openai's module docs.
+        let (collect_calls, filter_message): (
+            fn(&[serde_json::Value], &mut CallMap),
+            fn(&mut serde_json::Value, &mut Filter, &CallMap),
+        ) = match req.provider {
+            Provider::Anthropic => (collect_calls, filter_message),
+            Provider::Openai => (
+                crate::pipeline::ingest_openai::collect_calls,
+                crate::pipeline::ingest_openai::filter_message,
+            ),
+            _ => return Ok(()),
+        };
         // Context guard: if the request is near the provider's context window,
         // force aggressive compression so it fits — even if compression is off or
         // light by default. Prevents outright "prompt is too long" rejections.
@@ -995,13 +1011,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_anthropic_untouched() {
+    async fn unsupported_dialect_is_untouched() {
         let big = lines(2000);
         let body = serde_json::json!({
             "messages": [ tr_msg("a", serde_json::Value::String(big.clone())) ]
         });
         let t = IngestFilterTransform::fixed(CompressionLevel::Balanced);
-        let mut r = req(Provider::Openai, body);
+        let mut r = req(Provider::Google, body);
         t.on_request(&mut r).await.unwrap();
         assert_eq!(r.body["messages"][0]["content"][0]["content"], big);
         assert_eq!(r.tokens_saved, 0);
