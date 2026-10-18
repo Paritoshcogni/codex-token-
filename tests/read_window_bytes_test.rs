@@ -252,4 +252,3 @@ fn read_stdin_full_disk_exits_nonzero_without_abort() {
         "stderr was: {stderr}"
     );
 }
-
