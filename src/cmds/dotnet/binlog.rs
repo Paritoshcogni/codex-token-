@@ -176,14 +176,6 @@ const FLAG_MESSAGE: i32 = 1 << 2;
 const FLAG_SENDER_NAME: i32 = 1 << 3;
 const FLAG_THREAD_ID: i32 = 1 << 4;
 const FLAG_TIMESTAMP: i32 = 1 << 5;
-const FLAG_SUBCATEGORY: i32 = 1 << 6;
-const FLAG_CODE: i32 = 1 << 7;
-const FLAG_FILE: i32 = 1 << 8;
-const FLAG_PROJECT_FILE: i32 = 1 << 9;
-const FLAG_LINE_NUMBER: i32 = 1 << 10;
-const FLAG_COLUMN_NUMBER: i32 = 1 << 11;
-const FLAG_END_LINE_NUMBER: i32 = 1 << 12;
-const FLAG_END_COLUMN_NUMBER: i32 = 1 << 13;
 const FLAG_ARGUMENTS: i32 = 1 << 14;
 const FLAG_IMPORTANCE: i32 = 1 << 15;
 const FLAG_EXTENDED: i32 = 1 << 16;
@@ -506,38 +498,6 @@ fn read_event_fields(
         let _ = read_optional_string(reader, parsed)?;
         skip_string_dictionary(reader, file_format_version)?;
         let _ = read_optional_string(reader, parsed)?;
-    }
-
-    if flags & FLAG_SUBCATEGORY != 0 {
-        let _ = read_deduplicated_string(reader, parsed)?;
-    }
-
-    if flags & FLAG_CODE != 0 {
-        let _ = read_deduplicated_string(reader, parsed)?;
-    }
-
-    if flags & FLAG_FILE != 0 {
-        let _ = read_deduplicated_string(reader, parsed)?;
-    }
-
-    if flags & FLAG_PROJECT_FILE != 0 {
-        let _ = read_deduplicated_string(reader, parsed)?;
-    }
-
-    if flags & FLAG_LINE_NUMBER != 0 {
-        let _ = reader.read_7bit_i32()?;
-    }
-
-    if flags & FLAG_COLUMN_NUMBER != 0 {
-        let _ = reader.read_7bit_i32()?;
-    }
-
-    if flags & FLAG_END_LINE_NUMBER != 0 {
-        let _ = reader.read_7bit_i32()?;
-    }
-
-    if flags & FLAG_END_COLUMN_NUMBER != 0 {
-        let _ = reader.read_7bit_i32()?;
     }
 
     if flags & FLAG_ARGUMENTS != 0 {
