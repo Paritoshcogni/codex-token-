@@ -27,7 +27,14 @@ use super::ingest_filter::{CallMap, Filter, filter_tool_result_block, origin_lab
 /// Map `tool_call_id` → (function name, salient argument) from assistant
 /// `tool_calls[]` entries, so a later `role: "tool"` message can name its
 /// originating call in the dedup marker. Mirrors the Anthropic `collect_calls`.
-pub(crate) fn collect_calls(messages: &[serde_json::Value], calls: &mut CallMap) {
+/// `want_labels` is false in modes that never print the label, skipping the
+/// `function.arguments` JSON parse entirely (O(body) on huge Write/Edit
+/// arguments — the same cost note `normalize_openai` carries).
+pub(crate) fn collect_calls(
+    messages: &[serde_json::Value],
+    calls: &mut CallMap,
+    want_labels: bool,
+) {
     for msg in messages {
         if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
@@ -48,12 +55,15 @@ pub(crate) fn collect_calls(messages: &[serde_json::Value], calls: &mut CallMap)
             // best-effort and cosmetic (marker label only): a non-JSON body
             // leaves the marker name-only, exactly like an Anthropic call
             // without a salient input key.
-            let arg = tc
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .and_then(|input| salient_arg(&input));
+            let arg = if want_labels {
+                tc.get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|input| salient_arg(&input))
+            } else {
+                None
+            };
             calls.insert(id.to_string(), (name.to_string(), arg));
         }
     }

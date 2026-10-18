@@ -382,7 +382,20 @@ impl Filter {
 pub(crate) fn origin_label(call: Option<&(String, Option<String>)>) -> Option<String> {
     let (name, arg) = call?;
     match arg {
-        Some(a) if !a.is_empty() => Some(format!("{name}({a})")),
+        Some(a) if !a.is_empty() => {
+            // A heredoc-sized `command` would make the dedup marker bigger
+            // than the saving it reports; the label is cosmetic, so cap it.
+            let capped = if a.len() > 80 {
+                let mut end = 80;
+                while !a.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &a[..end])
+            } else {
+                a.clone()
+            };
+            Some(format!("{name}({capped})"))
+        }
         _ => Some(name.clone()),
     }
 }
@@ -465,9 +478,12 @@ pub(crate) fn salient_arg(input: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// Collect `tool_use_id` → (name, salient arg) from every `tool_use` block, so a
-/// later `tool_result` can name its originating call in the dedup marker.
-fn collect_calls(messages: &[serde_json::Value], calls: &mut CallMap) {
+/// Collect `tool_use_id` → (tool name, key argument) from every `tool_use`
+/// block, so a later `tool_result` can name its originating call in the dedup
+/// marker. `want_labels` is false in modes that never print the label
+/// (`LevelFilter` reads `origin` only in `DedupOnly`), skipping the
+/// salient-argument extraction entirely.
+fn collect_calls(messages: &[serde_json::Value], calls: &mut CallMap, want_labels: bool) {
     for msg in messages {
         let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
             continue;
@@ -482,7 +498,11 @@ fn collect_calls(messages: &[serde_json::Value], calls: &mut CallMap) {
             ) else {
                 continue;
             };
-            let arg = block.get("input").and_then(salient_arg);
+            let arg = if want_labels {
+                block.get("input").and_then(salient_arg)
+            } else {
+                None
+            };
             calls.insert(id.to_string(), (name.to_string(), arg));
         }
     }
@@ -671,6 +691,25 @@ impl IngestFilterTransform {
     }
 }
 
+/// Per-dialect navigation pair, kept atomic: mixing a collect with the
+/// other dialect's filter would mislabel every dedup marker, and a bare
+/// tuple of fn-pointers would happily mix them. `collect_calls` takes
+/// `want_labels` (see its doc).
+struct DialectNav {
+    collect_calls: fn(&[serde_json::Value], &mut CallMap, bool),
+    filter_message: fn(&mut serde_json::Value, &mut Filter, &CallMap),
+}
+
+const ANTHROPIC_NAV: DialectNav = DialectNav {
+    collect_calls,
+    filter_message,
+};
+
+const OPENAI_NAV: DialectNav = DialectNav {
+    collect_calls: crate::pipeline::ingest_openai::collect_calls,
+    filter_message: crate::pipeline::ingest_openai::filter_message,
+};
+
 #[async_trait::async_trait]
 impl Transform for IngestFilterTransform {
     fn name(&self) -> &'static str {
@@ -681,15 +720,9 @@ impl Transform for IngestFilterTransform {
         // Dialect selection: the per-message walk shape differs (Anthropic
         // content blocks vs OpenAI `role: "tool"` messages), the Filter
         // machinery is shared verbatim. See ingest_openai's module docs.
-        let (collect_calls, filter_message): (
-            fn(&[serde_json::Value], &mut CallMap),
-            fn(&mut serde_json::Value, &mut Filter, &CallMap),
-        ) = match req.provider {
-            Provider::Anthropic => (collect_calls, filter_message),
-            Provider::Openai => (
-                crate::pipeline::ingest_openai::collect_calls,
-                crate::pipeline::ingest_openai::filter_message,
-            ),
+        let nav = match req.provider {
+            Provider::Anthropic => ANTHROPIC_NAV,
+            Provider::Openai => OPENAI_NAV,
             _ => return Ok(()),
         };
         // Context guard: if the request is near the provider's context window,
@@ -722,7 +755,10 @@ impl Transform for IngestFilterTransform {
         // Pre-pass: map tool_use_id → originating call, so a tool_result's dedup
         // marker can name its call (read-only over the same history).
         let mut calls = CallMap::new();
-        collect_calls(messages, &mut calls);
+        // Origin labels are only ever printed by DedupOnly; LevelFilter (the
+        // common mode) would parse `input`/`function.arguments` bodies for a
+        // label it discards.
+        (nav.collect_calls)(messages, &mut calls, matches!(mode, Mode::DedupOnly));
 
         let mut f = Filter {
             mode,
@@ -732,7 +768,7 @@ impl Transform for IngestFilterTransform {
         // Whole history, in order. Earlier-first ordering is what makes the
         // backward-only dedup order-stable (hence cache-safe).
         for msg in messages.iter_mut() {
-            filter_message(msg, &mut f, &calls);
+            (nav.filter_message)(msg, &mut f, &calls);
         }
         if guard_fired {
             tracing::warn!(
