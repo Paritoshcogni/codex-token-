@@ -109,11 +109,11 @@ fn read_windows_still_apply_text_filtering_and_line_numbers() {
         ),
         (
             ["--head-lines", "1", "--line-numbers"].as_slice(),
-            "1 │ // comment\n",
+            "1\t// comment\n",
         ),
         (
             ["--tail-lines", "1", "--line-numbers"].as_slice(),
-            "1 │ fn gamma() {}\n",
+            "1\tfn gamma() {}\n",
         ),
     ] {
         let output = read_stdin(input, args);
