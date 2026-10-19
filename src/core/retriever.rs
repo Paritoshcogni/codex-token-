@@ -13,8 +13,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 mod retention;
 use retention::{evict, init_storage_accounting, maintain_store};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_ENTRY_BYTES: usize = 10 * 1024 * 1024;
@@ -191,22 +193,52 @@ fn db_path(cfg: &RetrieverConfig) -> Result<PathBuf> {
     Ok(base.join(RECALL_DB))
 }
 
-fn open(cfg: &RetrieverConfig) -> Result<Connection> {
-    let path = db_path(cfg)?;
+fn prepare_db_file(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         let _ = crate::core::utils::create_private_dir(parent);
     }
-    crate::core::utils::open_private(std::fs::OpenOptions::new().write(true).create(true), &path)
+    crate::core::utils::open_private(std::fs::OpenOptions::new().write(true).create(true), path)
         .with_context(|| format!("pre-create private recall DB: {}", path.display()))?;
-    let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
+    Ok(())
+}
+
+fn open_at(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
     // best-effort: NFS / read-only filesystems may reject WAL
     let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
     init_schema(&conn)?;
     Ok(conn)
 }
 
+#[cfg(test)]
+fn open(cfg: &RetrieverConfig) -> Result<Connection> {
+    let path = db_path(cfg)?;
+    prepare_db_file(&path)?;
+    open_at(&path)
+}
+
+fn writer_gate(path: &Path) -> Result<Arc<Mutex<()>>> {
+    static WRITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    // The file is pre-created before lookup, so first and later opens agree,
+    // including relative paths and symlinks. Hard-link aliases still rely on
+    // SQLite's own locking, just as writers in another process do.
+    let path = path.canonicalize().context("resolve recall writer path")?;
+    let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    writers.retain(|_, writer| writer.strong_count() > 0);
+    if let Some(writer) = writers.get(&path).and_then(Weak::upgrade) {
+        return Ok(writer);
+    }
+    let writer = Arc::new(Mutex::new(()));
+    writers.insert(path, Arc::downgrade(&writer));
+    Ok(writer)
+}
+
+type CachedConnection = (PathBuf, Connection, Arc<Mutex<()>>);
+
 thread_local! {
-    static CONN_CACHE: std::cell::RefCell<Option<(PathBuf, Connection)>> =
+    static CONN_CACHE: std::cell::RefCell<Option<CachedConnection>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -214,11 +246,22 @@ fn with_open<T>(cfg: &RetrieverConfig, f: impl FnOnce(&Connection) -> Result<T>)
     let path = db_path(cfg)?;
     CONN_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let reuse = matches!(&*cache, Some((p, _)) if *p == path && path.exists());
+        let reuse = matches!(&*cache, Some((p, _, _)) if *p == path && path.exists());
+        let writer = if reuse {
+            Arc::clone(&cache.as_ref().expect("cache populated above").2)
+        } else {
+            prepare_db_file(&path)?;
+            writer_gate(&path)?
+        };
+        // Cached store/trim writers queue here rather than consuming SQLite's
+        // finite busy timeout competing with each other. Other connections
+        // still use SQLite's timeout. Keep initialization inside the same gate.
+        // An unwinding transaction rolls back before this guard is poisoned.
+        let _guard = writer.lock().unwrap_or_else(|e| e.into_inner());
         if !reuse {
-            *cache = Some((path.clone(), open(cfg)?));
+            *cache = Some((path.clone(), open_at(&path)?, Arc::clone(&writer)));
         }
-        let (_, conn) = cache.as_ref().expect("cache populated above");
+        let (_, conn, _) = cache.as_ref().expect("cache populated above");
         f(conn)
     })
 }
@@ -816,6 +859,90 @@ mod tests {
     }
 
     #[test]
+    fn test_writer_gate_reuses_canonical_paths_and_releases_unused_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall.db");
+        prepare_db_file(&path).unwrap();
+        let writer = writer_gate(&path).unwrap();
+        let canonical = writer_gate(&path.canonicalize().unwrap()).unwrap();
+        let dotted = writer_gate(&dir.path().join(".").join("recall.db")).unwrap();
+        assert!(Arc::ptr_eq(&writer, &canonical));
+        assert!(Arc::ptr_eq(&writer, &dotted));
+        let weak = Arc::downgrade(&writer);
+        drop((writer, canonical, dotted));
+        assert!(weak.upgrade().is_none());
+        assert!(writer_gate(&path).unwrap().try_lock().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_writer_gate_reuses_symlink_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall.db");
+        let alias = dir.path().join("alias.db");
+        prepare_db_file(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(Arc::ptr_eq(
+            &writer_gate(&path).unwrap(),
+            &writer_gate(&alias).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_writer_gate_does_not_block_a_different_database() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.db");
+        prepare_db_file(&first).unwrap();
+        let writer = writer_gate(&first).unwrap();
+        let guard = writer.lock().unwrap();
+        let cfg = RetrieverConfig {
+            database_path: Some(dir.path().join("nested").join("second.db")),
+            ..RetrieverConfig::default()
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(store_inner(&cfg, b"stored\n", "cmd", None, 1).is_ok())
+                .unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        drop(guard);
+        worker.join().unwrap();
+        assert!(result.expect("an unrelated database must not wait for this writer"));
+    }
+
+    #[test]
+    fn test_writer_gate_recovers_after_transaction_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            max_total_bytes: 4,
+            compression: false,
+            ..temp_cfg(dir.path())
+        };
+        let old = store_inner(&cfg, b"old\n", "cmd", None, 1).unwrap();
+        let panic = std::panic::catch_unwind(|| {
+            let _ = with_open(&cfg, |conn| -> Result<()> {
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                tx.execute("DELETE FROM recall", [])?;
+                panic!("fixture panic inside a recall transaction");
+            });
+        });
+        assert!(panic.is_err());
+        let conn = open(&cfg).unwrap();
+        assert!(load_by_hash(&conn, &old.hash).unwrap().is_some());
+        assert_eq!(storage_totals(&conn), (1, 4));
+
+        let new = store_inner(&cfg, b"new\n", "cmd", None, 1).unwrap();
+        assert!(load_by_hash(&conn, &old.hash).unwrap().is_none());
+        assert!(load_by_hash(&conn, &new.hash).unwrap().is_some());
+        assert_eq!(storage_totals(&conn), (1, 4));
+        assert_eq!(stats_snapshot_with(&cfg).unwrap()[0].elisions, 2);
+    }
+
+    #[test]
     fn test_total_budget_defaults_to_legacy_unlimited() {
         let cfg: RetrieverConfig = toml::from_str("max_entries = 12").unwrap();
         assert_eq!(cfg.max_total_bytes, 0);
@@ -1166,6 +1293,81 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, actual);
         assert_eq!(stats_snapshot_with(&cfg).unwrap()[0].elisions, 80);
+    }
+
+    #[test]
+    fn test_concurrent_stores_do_not_spend_sqlite_timeout_on_local_writers() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            max_total_bytes: 40,
+            compression: false,
+            ..temp_cfg(dir.path())
+        };
+        drop(open(&cfg).unwrap());
+        let ready = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let cfg = cfg.clone();
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    let initialized = with_open(&cfg, |conn| {
+                        conn.busy_timeout(Duration::ZERO)?;
+                        Ok(())
+                    });
+                    ready.wait();
+                    initialized.unwrap();
+                    for j in 0..10 {
+                        store_inner(&cfg, format!("{i}:{j}\n").as_bytes(), "cmd", None, 1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let conn = open(&cfg).unwrap();
+        let (entries, bytes) = storage_totals(&conn);
+        assert!(entries <= 10);
+        assert!(bytes <= 40);
+        let actual: (i64, i64) = conn
+            .query_row("SELECT COUNT(*), SUM(length(blob)) FROM recall", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((entries, bytes), actual);
+        assert_eq!(stats_snapshot_with(&cfg).unwrap()[0].elisions, 80);
+    }
+
+    #[test]
+    fn test_concurrent_first_stores_initialize_one_database() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            database_path: Some(dir.path().join("nested").join("recall.db")),
+            max_total_bytes: 40,
+            compression: false,
+            ..RetrieverConfig::default()
+        };
+        let ready = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let cfg = cfg.clone();
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    ready.wait();
+                    store_inner(&cfg, format!("{i}:0\n").as_bytes(), "cmd", None, 1).unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(storage_totals(&open(&cfg).unwrap()), (8, 32));
+        assert_eq!(stats_snapshot_with(&cfg).unwrap()[0].elisions, 8);
     }
 
     #[test]
