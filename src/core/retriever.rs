@@ -268,7 +268,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE recall ADD COLUMN recalled INTEGER NOT NULL DEFAULT 0",
         [],
     );
-    init_storage_accounting(conn)
+    init_storage_accounting(conn).context("initialize recall accounting")
 }
 
 fn stat_family(slug: &str) -> &str {
@@ -471,7 +471,30 @@ pub fn store(
     }
     match store_inner(cfg, content, command, exit_code, shown_upto.max(1)) {
         Ok(r) => Stored::Saved(r),
-        Err(_) => Stored::Unavailable,
+        Err(_error) => {
+            // Test diagnostics deliberately omit paths, SQL, and stored output.
+            #[cfg(test)]
+            if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+                _error.downcast_ref::<rusqlite::Error>()
+            {
+                let stage = [
+                    "init recall schema",
+                    "initialize recall accounting",
+                    "begin recall storage transaction",
+                    "insert recall row",
+                    "evict recall storage entries",
+                    "commit recall output and retention",
+                ]
+                .into_iter()
+                .find(|stage| _error.chain().any(|cause| cause.to_string() == *stage))
+                .unwrap_or("other");
+                eprintln!(
+                    "recall store unavailable: stage={stage} sqlite_code={:?} extended_code={}",
+                    code.code, code.extended_code
+                );
+            }
+            Stored::Unavailable
+        }
     }
 }
 
@@ -524,7 +547,8 @@ fn store_inner(
         .map(|p| p.to_string_lossy().into_owned());
 
     with_open(cfg, |conn| {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("begin recall storage transaction")?;
         tx.execute(
         "INSERT INTO recall
          (hash, command, cwd, exit_code, created_at, total_lines, shown_upto, byte_size, truncated, codec, blob)
@@ -556,7 +580,7 @@ fn store_inner(
     )
     .context("insert recall row")?;
         bump_stat(&tx, command, "sqlite", "elisions");
-        evict(&tx, cfg, &[&hash])?;
+        evict(&tx, cfg, &[&hash]).context("evict recall storage entries")?;
         tx.commit().context("commit recall output and retention")?;
 
         Ok(StoredRef {
@@ -972,6 +996,143 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_store_waits_for_an_observed_writer_then_commits_atomically() {
+        use std::cell::RefCell;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        thread_local! {
+            static BUSY: RefCell<Option<mpsc::Sender<()>>> = const { RefCell::new(None) };
+        }
+        fn observe_busy(attempt: i32) -> bool {
+            BUSY.with(|sender| {
+                if let Some(sender) = sender.borrow_mut().take() {
+                    let _ = sender.send(());
+                }
+            });
+            std::thread::sleep(Duration::from_millis(1));
+            attempt < 5000
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            max_total_bytes: 4,
+            compression: false,
+            ..temp_cfg(dir.path())
+        };
+        store_inner(&cfg, b"old\n", "cmd", None, 1).unwrap();
+        let holder = open(&cfg).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (busy_tx, busy_rx) = mpsc::channel();
+        let worker_cfg = cfg.clone();
+        let worker = std::thread::spawn(move || {
+            with_open(&worker_cfg, |conn| {
+                conn.busy_handler(Some(observe_busy))?;
+                Ok(())
+            })
+            .unwrap();
+            BUSY.with(|sender| *sender.borrow_mut() = Some(busy_tx));
+            ready_tx.send(()).unwrap();
+            start_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            store_inner(&worker_cfg, b"new\n", "cmd", None, 1)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let tx = Transaction::new_unchecked(&holder, TransactionBehavior::Immediate).unwrap();
+        start_tx.send(()).unwrap();
+
+        // Release only after SQLite has actually encountered the writer lock.
+        // Sleeping before release would let an unscheduled worker miss the lock.
+        let observed = busy_rx.recv_timeout(Duration::from_secs(10));
+        tx.commit().unwrap();
+        let stored = worker.join().unwrap().unwrap();
+        observed.expect("worker must exercise SQLite's busy path");
+        assert_eq!(
+            load_by_hash(&holder, &stored.hash).unwrap().unwrap().blob,
+            b"new\n"
+        );
+        assert_eq!(storage_totals(&holder), (1, 4));
+        let actual: (i64, i64) = holder
+            .query_row(
+                "SELECT COUNT(*), SUM(length(blob)) FROM recall",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actual, (1, 4));
+        assert_eq!(stats_snapshot_with(&cfg).unwrap()[0].elisions, 2);
+    }
+
+    #[test]
+    fn test_busy_store_is_unavailable_without_partial_writes_and_can_retry() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            max_total_bytes: 4,
+            compression: false,
+            ..temp_cfg(dir.path())
+        };
+        let old = store_inner(&cfg, b"old\n", "cmd", None, 1).unwrap();
+        with_open(&cfg, |conn| {
+            // Fail immediately under the deliberately retained fixture lock.
+            // The production timeout and the concurrent-writer test are unchanged.
+            conn.busy_timeout(Duration::ZERO)?;
+            Ok(())
+        })
+        .unwrap();
+        let holder = open(&cfg).unwrap();
+        let tx = Transaction::new_unchecked(&holder, TransactionBehavior::Immediate).unwrap();
+        let error = store_inner(&cfg, b"new\n", "cmd", None, 1)
+            .err()
+            .expect("held writer must reject a no-wait store");
+        assert!(matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        assert!(matches!(
+            store(&cfg, b"new\n", "cmd", None, 1),
+            Stored::Unavailable
+        ));
+        assert_eq!(storage_totals(&holder), (1, 4));
+        let actual: (i64, i64) = holder
+            .query_row(
+                "SELECT COUNT(*), SUM(length(blob)) FROM recall",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actual, (1, 4));
+        assert!(load_by_hash(&holder, &old.hash).unwrap().is_some());
+        assert_eq!(stats_snapshot_with(&cfg).unwrap()[0].elisions, 1);
+        with_open(&cfg, |conn| {
+            assert!(
+                conn.is_autocommit(),
+                "failed store must not retain a transaction"
+            );
+            conn.busy_timeout(Duration::from_secs(5))?;
+            Ok(())
+        })
+        .unwrap();
+        tx.commit().unwrap();
+
+        let new = store_inner(&cfg, b"new\n", "cmd", None, 1).unwrap();
+        assert!(load_by_hash(&holder, &old.hash).unwrap().is_none());
+        assert!(load_by_hash(&holder, &new.hash).unwrap().is_some());
+        assert_eq!(storage_totals(&holder), (1, 4));
+        let actual: (i64, i64) = holder
+            .query_row(
+                "SELECT COUNT(*), SUM(length(blob)) FROM recall",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actual, (1, 4));
+        assert_eq!(stats_snapshot_with(&cfg).unwrap()[0].elisions, 2);
     }
 
     #[test]
