@@ -4,6 +4,7 @@ pub mod arg_tokenizer;
 pub mod args_utils;
 #[cfg(feature = "engine")]
 pub mod call_context;
+pub mod child_command;
 #[cfg(feature = "engine")]
 pub mod classify;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod constants;
 pub mod display_helpers;
 pub mod filter;
 pub mod guard;
+pub mod operand_glob;
 #[cfg(feature = "engine")]
 pub mod pipeline_cmd;
 #[cfg(feature = "engine")]
