@@ -43,8 +43,8 @@ mod workbuddy;
 // from here and is imported by name.
 use agents_md::*;
 use claude::{
-    hook_already_present, hook_gaps, remove_hook_from_settings, run_claude_md_mode,
-    run_default_mode, run_hook_only_mode,
+    hook_already_present, hook_gaps, remove_settings_entries, run_claude_md_mode, run_default_mode,
+    run_hook_only_mode,
 };
 use codex::{run_codex_mode, show_codex_config, uninstall_codex};
 use cursor::{
@@ -1021,6 +1021,17 @@ fn offer_proxy_onramp(settings_path: &Path, patch_mode: PatchMode, ctx: InitCont
     if aimed_here && autostart_present {
         return Ok(());
     }
+    // Routing Claude Code at a daemon that cannot be started breaks every
+    // session (#4604): only offer the proxy when its binary is installed, so
+    // the SessionStart hook can start it again after a reboot. A daemon that
+    // merely answers on the port today may not be startable tomorrow.
+    if !crate::llm_proxy::binary_available() {
+        eprintln!();
+        eprintln!(
+            "  RTK proxy not offered: rtk-proxy is not installed (`rtk llm-proxy start` says where to get it)."
+        );
+        return Ok(());
+    }
 
     if aimed_here {
         // The failure this flow exists to prevent: a base URL that outlives
@@ -1593,8 +1604,12 @@ pub fn uninstall_with_patch_mode(
     }
 
     // 4. Remove hook entry from settings.json
-    if remove_hook_from_settings(ctx)? {
+    let settings_removed = remove_settings_entries(ctx)?;
+    if settings_removed.hook {
         removed.push("settings.json: removed RTK hook entry".to_string());
+    }
+    if settings_removed.proxy_base_url {
+        removed.push("settings.json: removed env.ANTHROPIC_BASE_URL (RTK proxy)".to_string());
     }
 
     // 5. Remove OpenCode plugin
