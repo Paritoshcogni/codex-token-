@@ -472,6 +472,11 @@ fn run_s3_transfer(operation: &str, extra_args: &[String], verbose: u8) -> Resul
 
 fn filter_sts_identity(json_str: &str) -> Option<FilterResult> {
     let v: Value = serde_json::from_str(json_str).ok()?;
+    // When --query is used, AWS CLI outputs a JSON array (e.g., ["account", "arn"])
+    // instead of the full object. Return None to fall back to raw output.
+    if v.is_array() {
+        return None;
+    }
     let account = v["Account"].as_str().unwrap_or("?");
     let arn = v["Arn"].as_str().unwrap_or("?");
     Some(FilterResult::new(format!("AWS: {} {}", account, arn)))
@@ -1588,6 +1593,20 @@ mod tests {
     fn test_filter_sts_identity_invalid_json() {
         let result = filter_sts_identity("not json");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn bugfix_issue_4662_filter_sts_identity_query_output_returns_none() {
+        // When --query '[Account,Arn]' is used, AWS CLI outputs a JSON array
+        // like ["123456789012", "arn:aws:iam::123456789012:user/example"]
+        // The STS formatter expects a JSON object, so it should return None
+        // to trigger fallback to raw output (which preserves the queried values).
+        let json_array = r#"["123456789012", "arn:aws:iam::123456789012:user/example"]"#;
+        let result = filter_sts_identity(json_array);
+        assert!(
+            result.is_none(),
+            "filter should return None for JSON array input (--query output)"
+        );
     }
 
     #[test]
