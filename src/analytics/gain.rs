@@ -575,7 +575,10 @@ fn print_pipeline_row(label: &str, activity: String, saved: i64, pct: f64) {
 /// arm stays visible either way.
 fn warn_hook_issues() {
     match hook_check::status() {
-        hook_check::HookStatus::Missing if !crate::core::config::hook_warning_suppressed() => {
+        hook_check::HookStatus::Missing
+            if !crate::core::config::hook_warning_suppressed()
+                && !hook_check::is_any_agent_configured() =>
+        {
             eprintln!(
                 "{}",
                 "[warn] No hook installed — run `rtk init -g` for automatic token savings".yellow()
