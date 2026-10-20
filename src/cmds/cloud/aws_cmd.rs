@@ -472,6 +472,11 @@ fn run_s3_transfer(operation: &str, extra_args: &[String], verbose: u8) -> Resul
 
 fn filter_sts_identity(json_str: &str) -> Option<FilterResult> {
     let v: Value = serde_json::from_str(json_str).ok()?;
+    // When --query is used, AWS CLI returns a JSON array like ["account", "arn"]
+    // instead of an object with Account/Arn fields. Return None to fall back to raw output.
+    if v.is_array() {
+        return None;
+    }
     let account = v["Account"].as_str().unwrap_or("?");
     let arn = v["Arn"].as_str().unwrap_or("?");
     Some(FilterResult::new(format!("AWS: {} {}", account, arn)))
@@ -1588,6 +1593,20 @@ mod tests {
     fn test_filter_sts_identity_invalid_json() {
         let result = filter_sts_identity("not json");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn bugfix_issue_4662_test_filter_sts_identity_with_query_array() {
+        // When --query is used, AWS CLI returns a JSON array like ["account", "arn"]
+        // The filter should return None to fall back to raw output, not "AWS: ? ?"
+        let json_array = r#"["123456789012", "arn:aws:iam::123456789012:user/example"]"#;
+        let result = filter_sts_identity(json_array);
+        // This test should FAIL on current code because it returns Some("AWS: ? ?")
+        // Expected: None (fallback to raw output)
+        assert!(
+            result.is_none(),
+            "Expected None for JSON array input from --query"
+        );
     }
 
     #[test]
