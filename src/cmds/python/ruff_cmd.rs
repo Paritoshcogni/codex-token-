@@ -118,10 +118,14 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
             } else {
                 filter_passthrough_output(stdout, is_analyze_graph)
             };
-            // `ruff check --fix --exit-non-zero-on-fix` exits 1 when it fixed
-            // files: that is success, not failure. The guard must not fire on
-            // it (a config error still exits 2, which falls through below).
-            if exit_code == 1 && is_fix_success_invocation(args) {
+            // `ruff check` exits 1 with zero diagnostics only when it fixed
+            // every violation: fix enabled via argv (`--fix`/`--fix-only` +
+            // `--exit-non-zero-on-fix`) or via config (`fix = true`), and exit
+            // 1 then reports fixed files, not failures. A config error exits 2
+            // instead of 1, and remaining violations leave non-empty
+            // diagnostics, so the green verdict can only ever be trusted on
+            // exit 1 — the diagnostics are the signal, not argv.
+            if exit_code == 1 && filtered == "Ruff: No issues found" {
                 return filtered;
             }
             // "All files formatted correctly" / "No issues found" must never
@@ -132,12 +136,6 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     )
 }
 
-/// True for `ruff check --fix --exit-non-zero-on-fix` (and `--fix-only`):
-/// exit 1 reports fixed files, not remaining violations.
-fn is_fix_success_invocation(args: &[String]) -> bool {
-    let fixes = args.iter().any(|a| a == "--fix" || a == "--fix-only");
-    let reports_fix = args.iter().any(|a| a == "--exit-non-zero-on-fix");
-    fixes && reports_fix
 fn is_analyze_graph_invocation(args: &[String]) -> bool {
     matches!(args, [subcommand, action, ..] if subcommand == "analyze" && action == "graph")
 }
@@ -455,7 +453,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn analyze_graph_preserves_large_json_output() {
         let raw = include_str!("../../../tests/fixtures/ruff_analyze_graph_raw.json");
         assert!(raw.len() > config::limits().passthrough_max_chars);
@@ -495,16 +492,17 @@ mod tests {
             "rule output must be a capped prefix of ruff's, got {} of {} bytes",
             result.len(),
             raw.len()
-=======
-    fn test_ruff_fix_flag_exit_one_keeps_no_issues() {
-        // `ruff check --fix --exit-non-zero-on-fix` exits 1 when it fixed
-        // files: success, not failure. The guard would fire on the green
-        // verdict, so the exemption must keep it.
-        let args = ["check", "--fix", "--exit-non-zero-on-fix", "."]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        assert!(is_fix_success_invocation(&args));
+        );
+    }
+
+    #[test]
+    fn test_ruff_check_json_zero_diagnostics_is_the_green_verdict() {
+        // `[]` — a run that left nothing to report — is what the zero-
+        // diagnostics success form (`--fix`/`--fix-only` + `--exit-non-
+        // zero-on-fix`, from argv or config) prints at exit 1. `run()` exempts
+        // that verdict only because `exit_code == 1` plus this exact string
+        // proves the fix-success form; the pinned wiring lives in the
+        // integration test (`tests/ruff_fix_exit_test.rs`).
         let filtered = filter_ruff_check_json("[]");
         assert_eq!(filtered, "Ruff: No issues found");
         let guarded = crate::core::guard::guard_exit("[]", 1, "ruff", &filtered);
@@ -512,39 +510,19 @@ mod tests {
             guarded.contains("failed (exit 1)"),
             "guard fires here; run() must exempt this arm, got: {}",
             guarded
->>>>>>> 8eb43a42 (fix(guard): address round-2 review — vitest double-count, xfailed boundary, separator overhead, ruff fix-flag)
         );
-    }
-
-    #[test]
-<<<<<<< HEAD
-=======
-    fn test_ruff_fix_predicate_needs_both_flags() {
-        let both = ["--fix", "--exit-non-zero-on-fix"];
-        let fix_only = ["--fix"];
-        let flag_only = ["--exit-non-zero-on-fix"];
-        let fix_only_flag = ["--fix-only", "--exit-non-zero-on-fix"];
-        let mk = |flags: &[&str]| flags.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(is_fix_success_invocation(&mk(&both)));
-        assert!(is_fix_success_invocation(&mk(&fix_only_flag)));
-        assert!(!is_fix_success_invocation(&mk(&fix_only)));
-        assert!(!is_fix_success_invocation(&mk(&flag_only)));
-        assert!(!is_fix_success_invocation(&[]));
     }
 
     #[test]
     fn test_ruff_config_error_exit_two_empty_stdout_refuses_green() {
         // Config error: exit 2, empty stdout. A green verdict must still
-        // refuse to render.
-        let args = ["check"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(!is_fix_success_invocation(&args));
+        // refuse to render — the exemption is pinned to exit 1.
         let result = crate::core::guard::guard_exit("", 2, "ruff", "Ruff: No issues found");
         assert!(result.contains("ruff: failed (exit 2)"), "got: {}", result);
         assert!(!result.contains("No issues found"), "got: {}", result);
     }
 
     #[test]
->>>>>>> 8eb43a42 (fix(guard): address round-2 review — vitest double-count, xfailed boundary, separator overhead, ruff fix-flag)
     fn test_filter_ruff_check_no_issues() {
         let output = "[]";
         let result = filter_ruff_check_json(output);

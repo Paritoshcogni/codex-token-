@@ -710,6 +710,9 @@ FAILED test_outer - AssertionError
         ] {
             assert_eq!(filter_pytest_output(input), PYTEST_NO_TESTS, "{input}");
         }
+    }
+
+    #[test]
     fn test_filter_pytest_collection_error_stays_plain() {
         // Collection error under FORCE_COLOR: no summary line survives, so
         // the filter reports no tests and run() falls back to the stripped
