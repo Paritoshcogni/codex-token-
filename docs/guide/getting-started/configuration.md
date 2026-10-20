@@ -105,7 +105,7 @@ When a command fails — or a filter trims a long list — RTK persists the full
 
 ```
 FAILED: 2/15 tests
-[full output: rtk recall 36365b69eda6]
+[full output: rtk recall 36365b69eda6c4f1]
 ```
 
 Your AI assistant runs `rtk recall <hash>` exactly as printed in the hint — that is the whole agent interface. For humans inspecting the store: `rtk recall <hash> --full | --from N | --lines N | --grep PAT` and `rtk recall --list`. Storage is byte-faithful (`BLOB` + lossless gzip); the stored input is the captured command text, as with the previous tee files.
